@@ -1,0 +1,14 @@
+{
+  "id": "dev.bdg.adofai-export",
+  "version": "0.1.0",
+  "name": {
+    "zh": "ADOFAI 导出",
+    "en": "ADOFAI Export"
+  },
+  "description": {
+    "zh": "把踩点工程导出为 A Dance of Fire and Ice (.adofai) 关卡，支持双押、BPM 变速轨道与暂停补偿。",
+    "en": "Export the project as a Dance of Fire and Ice (.adofai) level, with double-press, BPM speed track and pause compensation."
+  },
+  "main": "main.js",
+  "renderer": "renderer.js"
+}
