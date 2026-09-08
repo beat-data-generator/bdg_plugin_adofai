@@ -130,7 +130,8 @@ window.__bdgPluginRegister(function activate(api) {
       var diffEff = diff * mult;
       var step = j === 0 ? 0 : wrap360((1 - diffEff) * 180);
       if (twirlSet && twirlSet[beats[j]]) dir = -dir;
-      current = wrap360(current + dir * step + dir * carry);
+      // dir 只作用于真实路径旋转 step；双押插入与 carry 不镜像
+      current = wrap360(current + dir * step + carry);
       panelLog(
         "tile#" + j +
           " beat=" + beats[j] +
@@ -141,16 +142,16 @@ window.__bdgPluginRegister(function activate(api) {
           " -> angle=" + current,
       );
       carry = 0;
-      angleData.push(current);
+      angleData.push(dir * current);
       beatFloor[j] = angleData.length - 1;
       if (useDouble && doubleSet[beats[j]]) {
-        current = wrap360(current + dir * (180 - angle));
-        angleData.push(current);
+        current = wrap360(current + (180 - angle));
+        angleData.push(dir * current);
         panelLog(
-          "  (双押插入) angle " + dir * (180 - angle) + " => angle=" + current +
-            " carry=" + dir * angle,
+          "  (双押插入) angle " + (180 - angle) + " => angle=" + current +
+            " carry=" + angle,
         );
-        carry = dir * angle;
+        carry = angle;
       }
     }
     return { angleData: angleData, beatFloor: beatFloor };
@@ -245,8 +246,9 @@ window.__bdgPluginRegister(function activate(api) {
     var idxByBeat = {};
     for (var i = 0; i < beats.length; i++) idxByBeat[beats[i]] = i;
     for (var b in twirlSet) {
-      arr.push({ floor: beatFloor[idxByBeat[b]], eventType: "Twirl" });
-      panelLog("Twirl: floor " + beatFloor[idxByBeat[b]] + " (beat " + b + ")");
+      var f = beatFloor[idxByBeat[b]] + 1;
+      arr.push({ floor: f, eventType: "Twirl" });
+      panelLog("Twirl: floor " + f + " (beat " + b + " +1)");
     }
     return arr;
   }
