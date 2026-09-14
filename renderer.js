@@ -315,7 +315,8 @@ window.__bdgPluginRegister(function activate(api) {
       }
     }
 
-    var useDouble = config.multiPress === "double";
+    // 新双押逻辑（180−夹角 / carry 补回）写在「多押」上；中旋暂复用同一逻辑
+    var useDouble = config.multiPress === "multi" || config.multiPress === "midspin";
     var built = buildAngleData(
       scan.beats,
       scan.doubleSet,
@@ -446,9 +447,9 @@ window.__bdgPluginRegister(function activate(api) {
         "multi-press",
         "多押处理: ",
         [
-          { value: "merge", text: "合并" },
-          { value: "double", text: "双押" },
+          { value: "merge", text: "单轨" },
           { value: "multi", text: "多押" },
+          { value: "midspin", text: "中旋" },
         ],
         function () {
           config.multiPress = mp.querySelector("select").value;
