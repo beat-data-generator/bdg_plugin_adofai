@@ -87,19 +87,32 @@ window.__bdgPluginRegister(function activate(api) {
   }
 
   var bpmKey = api.id + ":bpm";
+  var multiKey = api.id + ":multi";
   var twirlKey = api.id + ":twirl";
 
-  // 只统计音砖轨道（排除 BPM 轨道）：BPM 点只发 SetSpeed，不参与音砖/双押。
-  function scanBeats() {
-    var s = api.project.snapshot();
+  function findTrack(s, tid) {
+    for (var i = 0; i < s.tracks.length; i++) {
+      if (s.tracks[i].id === tid) return s.tracks[i];
+    }
+    return null;
+  }
+  function isBpmTrack(t) {
+    return t && (t.type === bpmKey || t.type === "bpm");
+  }
+  function isMultiTrack(t) {
+    return t && (t.type === multiKey || t.type === "multi");
+  }
+  function isTwirlTrack(t) {
+    return t && (t.type === twirlKey || t.type === "twirl");
+  }
+
+  // 只统计音砖轨道（排除 BPM 与多押事件轨道）：多押点只声明该位置怎么多押，不产生音砖。
+  function scanBeats(s) {
     var counts = {};
     for (var i = 0; i < s.markers.length; i++) {
       var m = s.markers[i];
-      var track = null;
-      for (var k2 = 0; k2 < s.tracks.length; k2++) {
-        if (s.tracks[k2].id === m.trackId) track = s.tracks[k2];
-      }
-      if (track && track.type === bpmKey) continue;
+      var track = findTrack(s, m.trackId);
+      if (isBpmTrack(track) || isMultiTrack(track)) continue;
       var beat = m.beat;
       if (beat in counts) counts[beat]++;
       else counts[beat] = 1;
@@ -109,93 +122,32 @@ window.__bdgPluginRegister(function activate(api) {
     beats.sort(function (a, b) {
       return a - b;
     });
-    var doubleSet = {};
-    for (var k in counts) if (counts[k] >= 2) doubleSet[k] = true;
-    return { beats: beats, doubleSet: doubleSet };
+    return beats;
   }
 
-  // 展开 floor：普通模式一个 beat 一块；双押模式在该 beat 之后再插一块。
-  // beatFloor[j] = beats[j] 对应的实际 floor 下标（给 actions 用）。
-  // multAt(beat) 返回该位置起的 BPM 倍率，角度用的拍差会乘以它。
-  // twirlSet[beat] 表示该 beat 有旋转点：每次旋转 dir 正负镜像（负→正→…）。
-  function buildAngleData(beats, doubleSet, useDouble, angle, multAt, twirlSet) {
-    var angleData = [];
-    var beatFloor = [];
-    var current = 0;
-    var carry = 0;
-    var dir = 1;
-    for (var j = 0; j < beats.length; j++) {
-      var diff = j === 0 ? 0 : beats[j] - beats[j - 1];
-      var mult = j === 0 ? 1 : multAt(beats[j - 1]);
-      var diffEff = diff * mult;
-      var step = j === 0 ? 0 : wrap360((1 - diffEff) * 180);
-      if (twirlSet && twirlSet[beats[j]]) dir = -dir;
-      // dir 只作用于真实路径旋转 step；双押插入与 carry 不镜像
-      current = wrap360(current + dir * step + carry);
-      panelLog(
-        "tile#" + j +
-          " beat=" + beats[j] +
-          (j === 0 ? "" : " diff=" + diff + " mult=" + mult + " diffEff=" + diffEff) +
-          " dir=" + dir +
-          " step=" + step +
-          " carry=" + carry +
-          " -> angle=" + current,
-      );
-      carry = 0;
-      angleData.push(dir * current);
-      beatFloor[j] = angleData.length - 1;
-      if (useDouble && doubleSet[beats[j]]) {
-        current = wrap360(current + (180 - angle));
-        angleData.push(dir * current);
-        panelLog(
-          "  (双押插入) angle " + (180 - angle) + " => angle=" + current +
-            " carry=" + angle,
-        );
-        carry = angle;
-      }
+  // 多押轨道点 → { beat: { multiType, maxKeys, angle } }
+  function readMultiPress(s) {
+    var plan = {};
+    for (var i = 0; i < s.markers.length; i++) {
+      var m = s.markers[i];
+      var track = findTrack(s, m.trackId);
+      if (!isMultiTrack(track)) continue;
+      var attrs = m.attrs || {};
+      var multiType = attrs.multiType || "single";
+      var maxKeys = Number(attrs.maxKeys != null ? attrs.maxKeys : 3);
+      var angle = Number(attrs.angle != null ? attrs.angle : 15);
+      if (!(maxKeys >= 2)) maxKeys = 2;
+      plan[m.beat] = { multiType: multiType, maxKeys: maxKeys, angle: angle };
     }
-    return { angleData: angleData, beatFloor: beatFloor };
-  }
-
-  // Pause 时长按拍计（引擎把 duration 看作等待拍数）。相邻 floor 自占 1 拍，
-  // 故填补有效间距 diffEff 需等待 diffEff - 1 拍。判断用有效拍差 diffEff > 2。
-  function buildActions(beats, beatFloor, multAt) {
-    var actions = [];
-    for (var j = 0; j < beats.length - 1; j++) {
-      var diff = beats[j + 1] - beats[j];
-      var mult = multAt(beats[j + 1]);
-      var diffEff = diff * mult;
-      if (diffEff > 2) {
-        var dur = diffEff - 1;
-        panelLog(
-          "Pause: beat " + beats[j] + "->" + beats[j + 1] +
-            " diff=" + diff +
-            " mult=" + mult +
-            " diffEff=" + diffEff +
-            " duration=" + dur +
-            " floor=" + beatFloor[j + 1],
-        );
-        actions.push({
-          floor: beatFloor[j + 1],
-          eventType: "Pause",
-          duration: dur,
-          countdownTicks: 0,
-          angleCorrectionDir: "Backward",
-        });
-      }
-    }
-    return actions;
+    return plan;
   }
 
   function readBpmPoints(s) {
     var out = [];
     for (var i = 0; i < s.markers.length; i++) {
       var m = s.markers[i];
-      var track = null;
-      for (var k = 0; k < s.tracks.length; k++) {
-        if (s.tracks[k].id === m.trackId) track = s.tracks[k];
-      }
-      if (track && track.type === bpmKey && m.attrs) {
+      var track = findTrack(s, m.trackId);
+      if (isBpmTrack(track) && m.attrs) {
         out.push({
           beat: m.beat,
           type: m.attrs.speedType,
@@ -209,36 +161,105 @@ window.__bdgPluginRegister(function activate(api) {
     return out;
   }
 
+  function readTwirlSet(s) {
+    var set = {};
+    for (var i = 0; i < s.markers.length; i++) {
+      var m = s.markers[i];
+      var track = findTrack(s, m.trackId);
+      if (isTwirlTrack(track)) set[m.beat] = true;
+    }
+    return set;
+  }
+
+  // 展开 floor：普通一个 beat 一块；多押点在该 beat 之后再插块…
+  //   multiType = single → 不插（单轨）
+  //   midspin → 插 1 块（双押，2 键）
+  //   multi   → 插 maxKeys−1 块（最多 maxKeys 键）
+  // 插入块角度 = 当前 + (180 − angle)；下一块用 carry 补回 +angle（仓库双押模型）。
+  function buildAngleData(beats, multiPlan, multAt, twirlSet) {
+    var angleData = [];
+    var beatFloor = [];
+    var current = 0;
+    var carry = 0;
+    var dir = 1;
+    for (var j = 0; j < beats.length; j++) {
+      var diff = j === 0 ? 0 : beats[j] - beats[j - 1];
+      var mult = j === 0 ? 1 : multAt(beats[j - 1]);
+      var diffEff = diff * mult;
+      var step = j === 0 ? 0 : wrap360((1 - diffEff) * 180);
+      if (twirlSet && twirlSet[beats[j]]) dir = -dir;
+      current = wrap360(current + dir * step + carry);
+      panelLog(
+        "tile#" + j +
+          " beat=" + beats[j] +
+          (j === 0 ? "" : " diff=" + diff + " mult=" + mult + " diffEff=" + diffEff) +
+          " dir=" + dir +
+          " step=" + step +
+          " carry=" + carry +
+          " -> angle=" + current,
+      );
+      carry = 0;
+      angleData.push(dir * current);
+      beatFloor[j] = angleData.length - 1;
+
+      var mp = multiPlan[beats[j]];
+      if (mp && mp.multiType !== "single") {
+        var blocks = mp.multiType === "midspin" ? 1 : mp.maxKeys - 1;
+        for (var q = 0; q < blocks; q++) {
+          current = wrap360(current + (180 - mp.angle)); // 插入块夹角度 180−angle
+          angleData.push(dir * current);
+        }
+        carry = mp.angle; // 下一块补 +angle（回正）
+        panelLog(
+          "  (多押插入) beat=" + beats[j] +
+            " type=" + mp.multiType +
+            " blocks=" + blocks +
+            " angle=" + mp.angle +
+            " carry=" + carry,
+        );
+      }
+    }
+    return { angleData: angleData, beatFloor: beatFloor };
+  }
+
+  // Pause 时长按拍计（引擎把 duration 看作等待拍数）。相邻 floor 自占 1 拍，
+  // 故填补有效间距 diffEff 需等待 diffEff − 1 拍。判断用有效拍差 diffEff > 2。
+  function buildActions(beats, beatFloor, multAt) {
+    var actions = [];
+    for (var j = 0; j < beats.length - 1; j++) {
+      var diff = beats[j + 1] - beats[j];
+      var mult = multAt(beats[j + 1]);
+      var diffEff = diff * mult;
+      if (diffEff > 2) {
+        var dur = diffEff - 1;
+        actions.push({
+          floor: beatFloor[j + 1],
+          eventType: "Pause",
+          duration: dur,
+          countdownTicks: 0,
+          angleCorrectionDir: "Backward",
+        });
+      }
+    }
+    return actions;
+  }
+
   function buildSetSpeed(beats, beatFloor, bpmPoints) {
     var arr = [];
     var idxByBeat = {};
     for (var i = 0; i < beats.length; i++) idxByBeat[beats[i]] = i;
     for (var k = 0; k < bpmPoints.length; k++) {
       var p = bpmPoints[k];
-      var evt = {
+      arr.push({
         floor: beatFloor[idxByBeat[p.beat]],
         eventType: "SetSpeed",
         speedType: p.type === "bpm" ? "Bpm" : "Multiplier",
         beatsPerMinute: p.type === "bpm" ? p.value : 100,
         bpmMultiplier: p.type === "bpm" ? 1 : p.value,
         angleOffset: 0,
-      };
-      arr.push(evt);
+      });
     }
     return arr;
-  }
-
-  function readTwirlBeats(s) {
-    var set = {};
-    for (var i = 0; i < s.markers.length; i++) {
-      var m = s.markers[i];
-      var track = null;
-      for (var k = 0; k < s.tracks.length; k++) {
-        if (s.tracks[k].id === m.trackId) track = s.tracks[k];
-      }
-      if (track && track.type === twirlKey) set[m.beat] = true;
-    }
-    return set;
   }
 
   function buildTwirl(beats, beatFloor, twirlSet) {
@@ -262,73 +283,64 @@ window.__bdgPluginRegister(function activate(api) {
     settings.bpm = baseBpm;
     settings.offset = Math.round(s.offsetMs);
 
-    var scan = scanBeats();
-    var beats = scan.beats;
+    var beats = scanBeats(s);
     var beatSet = {};
     for (var i = 0; i < beats.length; i++) beatSet[beats[i]] = true;
 
     var bpmPoints = readBpmPoints(s);
     for (var v = 0; v < bpmPoints.length; v++) {
       if (!(bpmPoints[v].beat in beatSet)) {
-        return {
-          error:
-            "BPM 点 beat " + bpmPoints[v].beat + " 未落在 marker 上，拒绝导出。",
-        };
+        return { error: "BPM 点 beat " + bpmPoints[v].beat + " 未落在 marker 上，拒绝导出。" };
       }
     }
 
-    panelLog(
-      "== export baseBpm=" + baseBpm +
-        " offset=" + Math.round(s.offsetMs) +
-        " song=" + (s.audioName || "") +
-        " beats=" + beats.length +
-        " mode=" + config.multiPress +
-        " doubleAngle=" + config.doubleAngle,
-    );
-    for (var pp = 0; pp < bpmPoints.length; pp++) {
-      panelLog(
-        "  BPM点 beat=" + bpmPoints[pp].beat +
-          " type=" + bpmPoints[pp].type +
-          " value=" + bpmPoints[pp].value +
-          " mult=" + (bpmPoints[pp].type === "bpm"
-            ? bpmPoints[pp].value / baseBpm
-            : bpmPoints[pp].value),
-      );
-    }
-
-    function bpmToMult(p) {
-      return p.type === "bpm" ? p.value / baseBpm : p.value;
-    }
     function multAt(beat) {
       var m = 1;
       for (var q = 0; q < bpmPoints.length; q++) {
-        if (bpmPoints[q].beat <= beat) m = bpmToMult(bpmPoints[q]);
+        var p = bpmPoints[q];
+        var mult = p.type === "bpm" ? p.value / baseBpm : p.value;
+        if (p.beat <= beat) m = mult;
         else break;
       }
       return m;
     }
 
-    var twirlSet = readTwirlBeats(s);
+    var twirlSet = readTwirlSet(s);
     for (var b in twirlSet) {
       if (!(b in beatSet)) {
         return { error: "旋转点 beat " + b + " 未落在 marker 上，拒绝导出。" };
       }
     }
 
-    // 新双押逻辑（180−夹角 / carry 补回）写在「多押」上；中旋暂复用同一逻辑
-    var useDouble = config.multiPress === "multi" || config.multiPress === "midspin";
-    var built = buildAngleData(
-      scan.beats,
-      scan.doubleSet,
-      useDouble,
-      config.doubleAngle,
-      multAt,
-      twirlSet,
-    );
-    var actions = buildActions(scan.beats, built.beatFloor, multAt);
-    actions = actions.concat(buildSetSpeed(scan.beats, built.beatFloor, bpmPoints));
-    actions = actions.concat(buildTwirl(scan.beats, built.beatFloor, twirlSet));
-    // 同 floor 顺序：先变速、再旋转、最后暂停
+    var multiPlan = readMultiPress(s);
+    for (var bb in multiPlan) {
+      if (!(bb in beatSet)) {
+        return { error: "多押点 beat " + bb + " 未落在 marker 上，拒绝导出。" };
+      }
+    }
+
+    for (var pp = 0; pp < bpmPoints.length; pp++) {
+      panelLog(
+        "  BPM点 beat=" + bpmPoints[pp].beat +
+          " type=" + bpmPoints[pp].type +
+          " value=" + bpmPoints[pp].value +
+          " mult=" + (bpmPoints[pp].type === "bpm" ? bpmPoints[pp].value / baseBpm : bpmPoints[pp].value),
+      );
+    }
+    for (var mb in multiPlan) {
+      var m0 = multiPlan[mb];
+      panelLog(
+        "  多押点 beat=" + mb +
+          " 类型=" + m0.multiType +
+          " 最大押数=" + m0.maxKeys +
+          " 角度=" + m0.angle,
+      );
+    }
+
+    var built = buildAngleData(beats, multiPlan, multAt, twirlSet);
+    var actions = buildActions(beats, built.beatFloor, multAt);
+    actions = actions.concat(buildSetSpeed(beats, built.beatFloor, bpmPoints));
+    actions = actions.concat(buildTwirl(beats, built.beatFloor, twirlSet));
     actions.sort(function (a, b) {
       if (a.floor !== b.floor) return a.floor - b.floor;
       var order = { SetSpeed: 0, Twirl: 1, Pause: 2 };
@@ -343,6 +355,12 @@ window.__bdgPluginRegister(function activate(api) {
         decorations: [],
       },
     };
+  }
+
+  var logEl = null;
+
+  function panelLog(msg) {
+    api.log(msg);
   }
 
   function doExport() {
@@ -367,6 +385,8 @@ window.__bdgPluginRegister(function activate(api) {
         api.log("adofai export:", ok ? "saved" : "write failed");
       });
   }
+
+  // ---------------- 轨道类型注册 ----------------
 
   api.trackTypes.register({
     id: "bpm",
@@ -393,111 +413,52 @@ window.__bdgPluginRegister(function activate(api) {
     ],
   });
 
+  // 多押轨道：踩点 attrs（类型/最大押数/角度）驱动该位置及之后的多押生成。当前块保留，
+  // 其后插 (180−角度) 的块，再以 carry 补回 +角度。
   api.trackTypes.register({
-    id: "twirl",
-    trackName: { zh: "ADOFAI 旋转轨道", en: "ADOFAI Twirl Track" },
-    pointName: { zh: "旋转点", en: "Twirl" },
-    color: "#a78bfa",
-    fields: [],
+    id: "multi",
+    trackName: { zh: "多押轨道", en: "Multi-press Track" },
+    pointName: { zh: "多押点", en: "Multi-press" },
+    color: "#f59e0b",
+    fields: [
+      {
+        key: "multiType",
+        label: { zh: "多押类型", en: "Type" },
+        type: "enum",
+        default: "single",
+        options: [
+          { value: "single", label: { zh: "单轨", en: "Single" } },
+          { value: "midspin", label: { zh: "中旋", en: "Midspin" } },
+          { value: "multi", label: { zh: "多押", en: "Multi" } },
+        ],
+      },
+      {
+        key: "maxKeys",
+        label: { zh: "最大押数", en: "Max keys" },
+        type: "number",
+        default: 3,
+        min: 2,
+        max: 8,
+      },
+      {
+        key: "angle",
+        label: { zh: "多押角度", en: "Angle" },
+        type: "enum",
+        default: 15,
+        options: [
+          { value: 1, label: "1°" },
+          { value: 5, label: "5°" },
+          { value: 15, label: "15°" },
+          { value: 22.5, label: "22.5°" },
+          { value: 30, label: "30°" },
+        ],
+      },
+    ],
   });
 
-  var config = {
-    multiPress: "merge",
-    doubleAngle: 15,
-  };
+  // 旋转轨道已从 UI 移除（不再可创建），内部 Twirl 生成逻辑保留。
 
-  var logEl = null;
-  var logLines = [];
-
-  function panelLog(msg) {
-    logLines.push(String(msg));
-    if (logEl) {
-      logEl.textContent = logLines.join("\n");
-      logEl.scrollTop = logEl.scrollHeight;
-    }
-    api.log(msg);
-  }
-
-  function selectEl(id, labelText, options, onchange) {
-    var label = document.createElement("label");
-    label.textContent = labelText;
-    var sel = document.createElement("select");
-    sel.id = id;
-    for (var i = 0; i < options.length; i++) {
-      var opt = document.createElement("option");
-      opt.value = options[i].value;
-      opt.textContent = options[i].text;
-      sel.appendChild(opt);
-    }
-    if (onchange) sel.addEventListener("change", onchange);
-    label.appendChild(sel);
-    return label;
-  }
-
-  api.ui.registerPanel({
-    id: "adofai-config",
-    title: { zh: "ADOFAI 导出设置", en: "ADOFAI Export Options" },
-    mount: function mount(host) {
-      host.textContent = "";
-
-      var wrap = document.createElement("div");
-      host.appendChild(wrap);
-
-      var mp = selectEl(
-        "multi-press",
-        "多押处理: ",
-        [
-          { value: "merge", text: "单轨" },
-          { value: "multi", text: "多押" },
-          { value: "midspin", text: "中旋" },
-        ],
-        function () {
-          config.multiPress = mp.querySelector("select").value;
-          api.log("multiPress ->", config.multiPress);
-        },
-      );
-      wrap.appendChild(mp);
-
-      var dbl = selectEl(
-        "double-angle",
-        "双押角度: ",
-        [
-          { value: 15, text: "15°" },
-          { value: 22.5, text: "22.5°" },
-          { value: 30, text: "30°" },
-        ],
-        function () {
-          config.doubleAngle = parseFloat(dbl.querySelector("select").value);
-          api.log("doubleAngle ->", config.doubleAngle);
-        },
-      );
-      wrap.appendChild(dbl);
-
-      mp.querySelector("select").value = config.multiPress;
-      dbl.querySelector("select").value = config.doubleAngle;
-
-      var btnLog = document.createElement("button");
-      btnLog.textContent = "清空日志";
-      btnLog.addEventListener("click", function () {
-        logLines = [];
-        logEl.textContent = "";
-      });
-      wrap.appendChild(btnLog);
-
-      logEl = document.createElement("pre");
-      logEl.style.maxHeight = "240px";
-      logEl.style.overflowY = "auto";
-      logEl.style.whiteSpace = "pre-wrap";
-      logEl.style.wordBreak = "break-all";
-      logEl.textContent = "";
-      wrap.appendChild(logEl);
-
-      return function unmount() {
-        logEl = null;
-        host.textContent = "";
-      };
-    },
-  });
+  // ---------------- 出口：导出按钮 ----------------
 
   api.ui.registerExporter({
     label: { zh: "ADOFAI 关卡 (.adofai)", en: "ADOFAI level (.adofai)" },
