@@ -122,7 +122,7 @@ window.__bdgPluginRegister(function activate(api) {
     beats.sort(function (a, b) {
       return a - b;
     });
-    return beats;
+    return { beats: beats, counts: counts };
   }
 
   // 多押轨道点 → { beat: { multiType, maxKeys, angle } }
@@ -175,19 +175,37 @@ window.__bdgPluginRegister(function activate(api) {
   //   multiType = single → 不插（单轨）
   //   midspin → 插 1 块（双押，2 键）
   //   multi   → 插 maxKeys−1 块（最多 maxKeys 键）
+  // 状态机模型：处理规则统一——每个 beat 都按「当前多押状态」生成块。
+  //   - 多押点会改写当前状态，并从该点起作用于它自己和它后面的所有 beat；
+  //   - 后面若再遇到新多押点，则从新点起切换到新状态。
+  //   - 初始状态 = 单轨。状态：单轨=不插；中旋=插1块；多押=插 maxKeys−1 块。
   // 插入块角度 = 当前 + (180 − angle)；下一块用 carry 补回 +angle（仓库双押模型）。
-  function buildAngleData(beats, multiPlan, multAt, twirlSet) {
+  function buildAngleData(beats, counts, multiPlan, multAt, twirlSet) {
     var angleData = [];
     var beatFloor = [];
     var current = 0;
     var carry = 0;
     var dir = 1;
+    var state = { multiType: "single", maxKeys: 3, angle: 15 }; // 初始：单轨
     for (var j = 0; j < beats.length; j++) {
       var diff = j === 0 ? 0 : beats[j] - beats[j - 1];
       var mult = j === 0 ? 1 : multAt(beats[j - 1]);
       var diffEff = diff * mult;
       var step = j === 0 ? 0 : wrap360((1 - diffEff) * 180);
       if (twirlSet && twirlSet[beats[j]]) dir = -dir;
+
+      // 状态切换：该 beat 有多押点 → 从当前点起改用新状态（含单轨=关闭多押）
+      var mp = multiPlan[beats[j]];
+      if (mp) {
+        state = { multiType: mp.multiType, maxKeys: mp.maxKeys, angle: mp.angle };
+        panelLog(
+          "  (状态切换) beat=" + beats[j] +
+            " -> type=" + state.multiType +
+            " maxKeys=" + state.maxKeys +
+            " angle=" + state.angle,
+        );
+      }
+
       current = wrap360(current + dir * step + carry);
       panelLog(
         "tile#" + j +
@@ -196,25 +214,37 @@ window.__bdgPluginRegister(function activate(api) {
           " dir=" + dir +
           " step=" + step +
           " carry=" + carry +
+          " state=" + state.multiType +
           " -> angle=" + current,
       );
       carry = 0;
       angleData.push(dir * current);
       beatFloor[j] = angleData.length - 1;
 
-      var mp = multiPlan[beats[j]];
-      if (mp && mp.multiType !== "single") {
-        var blocks = mp.multiType === "midspin" ? 1 : mp.maxKeys - 1;
+      // 仅当该 beat 本身是「多押」（同 beat ≥2 个音砖）时才处理；
+      // 普通单押 beat 一律不处理（即使当前状态是多押）。
+      //   单轨 → 合并（不插）；中旋 → 插 1 块；多押 → 插 min(押数, 最大押数) − 1 块。
+      var pressCount = counts[beats[j]] || 1;
+      var isMultiBeat = pressCount >= 2;
+      var blocks = 0;
+      if (isMultiBeat && state.multiType !== "single") {
+        blocks =
+          state.multiType === "midspin"
+            ? 1
+            : Math.min(pressCount, state.maxKeys) - 1;
+        if (blocks < 1) blocks = 1;
+      }
+      if (blocks > 0) {
         for (var q = 0; q < blocks; q++) {
-          current = wrap360(current + (180 - mp.angle)); // 插入块夹角度 180−angle
+          current = wrap360(current + (180 - state.angle)); // 插入块夹角度 180−angle
           angleData.push(dir * current);
         }
-        carry = mp.angle; // 下一块补 +angle（回正）
+        carry = state.angle; // 下一块补 +angle（回正）
         panelLog(
           "  (多押插入) beat=" + beats[j] +
-            " type=" + mp.multiType +
+            " 押数=" + pressCount +
             " blocks=" + blocks +
-            " angle=" + mp.angle +
+            " angle=" + state.angle +
             " carry=" + carry,
         );
       }
@@ -244,17 +274,19 @@ window.__bdgPluginRegister(function activate(api) {
     return actions;
   }
 
-  function buildSetSpeed(beats, beatFloor, bpmPoints) {
+  function buildSetSpeed(beats, beatFloor, bpmPoints, baseBpm) {
     var arr = [];
     var idxByBeat = {};
     for (var i = 0; i < beats.length; i++) idxByBeat[beats[i]] = i;
+    var bpm = baseBpm; // 累积当前 BPM，用于把倍频点的 beatsPerMinute 写成累积后的绝对值
     for (var k = 0; k < bpmPoints.length; k++) {
       var p = bpmPoints[k];
+      bpm = p.type === "bpm" ? p.value : bpm * p.value;
       arr.push({
         floor: beatFloor[idxByBeat[p.beat]],
         eventType: "SetSpeed",
         speedType: p.type === "bpm" ? "Bpm" : "Multiplier",
-        beatsPerMinute: p.type === "bpm" ? p.value : 100,
+        beatsPerMinute: bpm,
         bpmMultiplier: p.type === "bpm" ? 1 : p.value,
         angleOffset: 0,
       });
@@ -283,7 +315,9 @@ window.__bdgPluginRegister(function activate(api) {
     settings.bpm = baseBpm;
     settings.offset = Math.round(s.offsetMs);
 
-    var beats = scanBeats(s);
+    var scan = scanBeats(s);
+    var beats = scan.beats;
+    var counts = scan.counts;
     var beatSet = {};
     for (var i = 0; i < beats.length; i++) beatSet[beats[i]] = true;
 
@@ -294,15 +328,20 @@ window.__bdgPluginRegister(function activate(api) {
       }
     }
 
-    function multAt(beat) {
-      var m = 1;
+    // 累积计算当前 BPM：从 baseBpm 起，依次套用每个点——
+    //   「BPM值」= 绝对重置；「倍频」= 乘在当前 BPM 上（连续两个 2 倍频 => ×4）。
+    function bpmAt(beat) {
+      var bpm = baseBpm;
       for (var q = 0; q < bpmPoints.length; q++) {
         var p = bpmPoints[q];
-        var mult = p.type === "bpm" ? p.value / baseBpm : p.value;
-        if (p.beat <= beat) m = mult;
+        if (p.beat <= beat) bpm = p.type === "bpm" ? p.value : bpm * p.value;
         else break;
       }
-      return m;
+      return bpm;
+    }
+    // 相对 baseBpm 的倍率（角度 / Pause 换算用）
+    function multAt(beat) {
+      return bpmAt(beat) / baseBpm;
     }
 
     var twirlSet = readTwirlSet(s);
@@ -319,12 +358,15 @@ window.__bdgPluginRegister(function activate(api) {
       }
     }
 
+    var _bpmLog = baseBpm;
     for (var pp = 0; pp < bpmPoints.length; pp++) {
+      _bpmLog = bpmPoints[pp].type === "bpm" ? bpmPoints[pp].value : _bpmLog * bpmPoints[pp].value;
       panelLog(
         "  BPM点 beat=" + bpmPoints[pp].beat +
           " type=" + bpmPoints[pp].type +
           " value=" + bpmPoints[pp].value +
-          " mult=" + (bpmPoints[pp].type === "bpm" ? bpmPoints[pp].value / baseBpm : bpmPoints[pp].value),
+          " -> bpm=" + _bpmLog +
+          " mult=" + _bpmLog / baseBpm,
       );
     }
     for (var mb in multiPlan) {
@@ -337,9 +379,9 @@ window.__bdgPluginRegister(function activate(api) {
       );
     }
 
-    var built = buildAngleData(beats, multiPlan, multAt, twirlSet);
+    var built = buildAngleData(beats, counts, multiPlan, multAt, twirlSet);
     var actions = buildActions(beats, built.beatFloor, multAt);
-    actions = actions.concat(buildSetSpeed(beats, built.beatFloor, bpmPoints));
+    actions = actions.concat(buildSetSpeed(beats, built.beatFloor, bpmPoints, baseBpm));
     actions = actions.concat(buildTwirl(beats, built.beatFloor, twirlSet));
     actions.sort(function (a, b) {
       if (a.floor !== b.floor) return a.floor - b.floor;
