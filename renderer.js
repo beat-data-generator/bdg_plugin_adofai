@@ -86,9 +86,40 @@ window.__bdgPluginRegister(function activate(api) {
     return v;
   }
 
+  // 中旋写法 [X₁,999,X₂,999,…,原格] 的参数（见 core/dp_midspin.py）：
+  //   MIDSPIN    999 → 0 拍、出角=入角，与下一格同一瞬间按下
+  //   DP_MIN_TRAVEL 原格 travel 被吃掉 Σsᵢ 后不能低于此值，否则成回头方块
+  var MIDSPIN = 999;
+  var DP_MIN_TRAVEL = 15;
+
   var bpmKey = api.id + ":bpm";
   var multiKey = api.id + ":multi";
   var twirlKey = api.id + ":twirl";
+
+  // 面板设置：变速放置位置偏移（floor 相加，正数往后挪格）、暂停数值修复#1。
+  var CONFIG_KEY = api.id + ":config";
+  var config = { speedPlaceOffset: 1, pauseFix1: true };
+  try {
+    var savedConfig = localStorage.getItem(CONFIG_KEY);
+    if (savedConfig) {
+      var parsedConfig = JSON.parse(savedConfig);
+      if (parsedConfig && typeof parsedConfig === "object") {
+        if (typeof parsedConfig.speedPlaceOffset === "number")
+          config.speedPlaceOffset = parsedConfig.speedPlaceOffset;
+        if (typeof parsedConfig.pauseFix1 === "boolean")
+          config.pauseFix1 = parsedConfig.pauseFix1;
+      }
+    }
+  } catch (e) {
+    api.log("adofai: load config failed:", e);
+  }
+  function saveConfig() {
+    try {
+      localStorage.setItem(CONFIG_KEY, JSON.stringify(config));
+    } catch (e) {
+      api.log("adofai: save config failed:", e);
+    }
+  }
 
   function findTrack(s, tid) {
     for (var i = 0; i < s.tracks.length; i++) {
@@ -171,15 +202,21 @@ window.__bdgPluginRegister(function activate(api) {
     return set;
   }
 
-  // 展开 floor：普通一个 beat 一块；多押点在该 beat 之后再插块…
-  //   multiType = single → 不插（单轨）
-  //   midspin → 插 1 块（双押，2 键）
-  //   multi   → 插 maxKeys−1 块（最多 maxKeys 键）
+  // 展开 floor：普通一个 beat 一块；多押点在该 beat 之前/之后再插块…
+  //   multiType = single  → 不插（单轨）
+  //   midspin → 在「原格」之前插 [X₁,999,X₂,999,…]（真·中旋，N 押 N 键，零净偏移）
+  //   multi   → 在原格之后插 min(押数, 最大押数)−1 块（最多 maxKeys 键）
   // 状态机模型：处理规则统一——每个 beat 都按「当前多押状态」生成块。
   //   - 多押点会改写当前状态，并从该点起作用于它自己和它后面的所有 beat；
   //   - 后面若再遇到新多押点，则从新点起切换到新状态。
-  //   - 初始状态 = 单轨。状态：单轨=不插；中旋=插1块；多押=插 maxKeys−1 块。
-  // 插入块角度 = 当前 + (180 − angle)；下一块用 carry 补回 +angle（仓库双押模型）。
+  //   - 初始状态 = 单轨。
+  // 中旋写法（对齐 core/dp_midspin.py 的三格 [X, 999, 原格]，>2 押叠加）：
+  //   押数 = min(押数, 最大押数)，插 presses−1 对 [Xᵢ, 999]；
+  //   第 i 个折返角 sᵢ = i × 多押角度；原格角度不变，travel 从 T 变 T−Σsᵢ；
+  //   ⇒ Σsᵢ + 0 + (T−Σsᵢ) ≡ T，前后时序与下游角度都零净偏移。
+  //   X₁ 是准时的那次按下（主音压 X₁）。放不下 Σsᵢ 则跳过该点多押（记日志）。
+  // 多押写法：插入块角度 = 当前 + (180 − angle)（各块 travel = angle）；
+  //   下一块用 carry 补回「插入块数 × angle」（累加修正）。
   function buildAngleData(beats, counts, multiPlan, multAt, twirlSet) {
     var angleData = [];
     var beatFloor = [];
@@ -218,28 +255,55 @@ window.__bdgPluginRegister(function activate(api) {
           " -> angle=" + current,
       );
       carry = 0;
-      angleData.push(dir * current);
-      beatFloor[j] = angleData.length - 1;
 
       // 仅当该 beat 本身是「多押」（同 beat ≥2 个音砖）时才处理；
       // 普通单押 beat 一律不处理（即使当前状态是多押）。
-      //   单轨 → 合并（不插）；中旋 → 插 1 块；多押 → 插 min(押数, 最大押数) − 1 块。
       var pressCount = counts[beats[j]] || 1;
       var isMultiBeat = pressCount >= 2;
+
+      // ── 中旋（真·三格写法，>2 押则叠加）：在原格之前依次插 [X₁,999,X₂,999,…]，
+      //    原格角度不变。第 i 个折返角 sᵢ = i × 多押角度；travel_Xᵢ = sᵢ、
+      //    travel_999 = 0、travel_原格 = T − Σsᵢ ⇒ 总 travel 不变，
+      //    零净偏移、下游角度不变。主音（准时按下）压 X₁。
+      if (isMultiBeat && state.multiType === "midspin" && j > 0) {
+        var T = diffEff * 180;
+        var presses = Math.min(pressCount, state.maxKeys); // 按最大押数截断
+        var pairs = presses - 1;
+        var sumS = (state.angle * pairs * (pairs + 1)) / 2; // Σ i×angle
+        if (sumS > 0 && T - sumS >= DP_MIN_TRAVEL) {
+          var partial = 0;
+          for (var q = 1; q <= pairs; q++) {
+            partial += state.angle * q;
+            var xCurrent = wrap360(current + (T - partial)); // Xᵢ 折返格
+            if (q === 1) beatFloor[j] = angleData.length; // 主音压 X₁
+            angleData.push(dir * xCurrent);
+            angleData.push(MIDSPIN); // 999：0 拍，与下一格同瞬间
+          }
+          angleData.push(dir * current); // 原格：角度不变，travel 被吃掉 Σsᵢ
+          panelLog(
+            "  (中旋插入) beat=" + beats[j] +
+              " 押数=" + presses + " Σs=" + sumS + " T=" + T,
+          );
+          continue;
+        }
+        panelLog("  (中旋跳过：T=" + T + " 装不下 Σs=" + sumS + ") beat=" + beats[j]);
+      }
+
+      angleData.push(dir * current);
+      beatFloor[j] = angleData.length - 1;
+
+      // 多押（multi）：在原格之后插 min(押数, 最大押数) − 1 块。
       var blocks = 0;
-      if (isMultiBeat && state.multiType !== "single") {
-        blocks =
-          state.multiType === "midspin"
-            ? 1
-            : Math.min(pressCount, state.maxKeys) - 1;
+      if (isMultiBeat && state.multiType === "multi") {
+        blocks = Math.min(pressCount, state.maxKeys) - 1;
         if (blocks < 1) blocks = 1;
       }
       if (blocks > 0) {
         for (var q = 0; q < blocks; q++) {
-          current = wrap360(current + (180 - state.angle)); // 插入块夹角度 180−angle
+          current = wrap360(current + (180 - state.angle)); // 插入块夹角 180−angle
           angleData.push(dir * current);
         }
-        carry = state.angle; // 下一块补 +angle（回正）
+        carry = state.angle * blocks; // 下一块补 Σ(每块 angle)（累加回正）
         panelLog(
           "  (多押插入) beat=" + beats[j] +
             " 押数=" + pressCount +
@@ -262,6 +326,11 @@ window.__bdgPluginRegister(function activate(api) {
       var diffEff = diff * mult;
       if (diffEff > 2) {
         var dur = diffEff - 1;
+        // 暂停数值修复#1：(1,2) 向上取整为 2，(2,3) 向下取整为 2。
+        if (config.pauseFix1) {
+          if (dur > 1 && dur < 2) dur = 2;
+          else if (dur > 2 && dur < 3) dur = 2;
+        }
         actions.push({
           floor: beatFloor[j + 1],
           eventType: "Pause",
@@ -274,7 +343,7 @@ window.__bdgPluginRegister(function activate(api) {
     return actions;
   }
 
-  function buildSetSpeed(beats, beatFloor, bpmPoints, baseBpm) {
+  function buildSetSpeed(beats, beatFloor, bpmPoints, baseBpm, settings) {
     var arr = [];
     var idxByBeat = {};
     for (var i = 0; i < beats.length; i++) idxByBeat[beats[i]] = i;
@@ -282,8 +351,15 @@ window.__bdgPluginRegister(function activate(api) {
     for (var k = 0; k < bpmPoints.length; k++) {
       var p = bpmPoints[k];
       bpm = p.type === "bpm" ? p.value : bpm * p.value;
+      var floor = beatFloor[idxByBeat[p.beat]] + config.speedPlaceOffset;
+      // floor ≤ 0 上的 SetSpeed 会被引擎忽略：改为写进 settings 的初始 BPM。
+      if (floor <= 0) {
+        settings.bpm = bpm;
+        panelLog("  (初始BPM) beat=" + p.beat + " -> settings.bpm=" + bpm);
+        continue;
+      }
       arr.push({
-        floor: beatFloor[idxByBeat[p.beat]],
+        floor: floor,
         eventType: "SetSpeed",
         speedType: p.type === "bpm" ? "Bpm" : "Multiplier",
         beatsPerMinute: bpm,
@@ -305,6 +381,55 @@ window.__bdgPluginRegister(function activate(api) {
     }
     return arr;
   }
+
+  function round2(v) {
+    return Math.round(v * 100) / 100;
+  }
+
+  // 导出检查（仅提醒，不阻拦）①：某段 BPM 落在 (8×baseBpm, 16×baseBpm) 区间。
+  function checkBpmRange(baseBpm, bpmPoints, beatFloor, idxByBeat) {
+    var out = [];
+    var bpm = baseBpm;
+    for (var i = 0; i < bpmPoints.length; i++) {
+      var p = bpmPoints[i];
+      bpm = p.type === "bpm" ? p.value : bpm * p.value;
+      var ratio = bpm / baseBpm;
+      if (ratio > 8 && ratio < 16) {
+        var idx = idxByBeat[p.beat];
+        var floor = idx != null ? beatFloor[idx] + config.speedPlaceOffset : -1;
+        out.push(
+          "变速 beat " + p.beat + "（floor " + floor + "）：BPM " + round2(bpm) +
+            "（" + round2(ratio) + "× 基准），处于 8×~16× 区间，请检查。",
+        );
+      }
+    }
+    return out;
+  }
+
+  // 导出检查（仅提醒，不阻拦）②：多押/中旋模式下，某块的夹角（travel）小于该点的多押角度。
+  //   夹角 = |180 − step|（直线 = 180°，回头 = 0°）。
+  function checkSmallAngles(beats, beatFloor, multiPlan, multAt) {
+    var out = [];
+    var state = { multiType: "single", maxKeys: 3, angle: 15 };
+    for (var j = 0; j < beats.length; j++) {
+      var mp = multiPlan[beats[j]];
+      if (mp) state = { multiType: mp.multiType, maxKeys: mp.maxKeys, angle: mp.angle };
+      if (j === 0) continue;
+      var diff = beats[j] - beats[j - 1];
+      var mult = multAt(beats[j - 1]);
+      var diffEff = diff * mult;
+      var step = wrap360((1 - diffEff) * 180);
+      var travel = Math.abs(180 - step);
+      if (state.multiType !== "single" && travel < state.angle - 1e-9) {
+        out.push(
+          "夹角 beat " + beats[j] + "（floor " + beatFloor[j] + "）：travel " +
+            round2(travel) + "° < 多押角度 " + state.angle + "°，请检查。",
+        );
+      }
+    }
+    return out;
+  }
+
 
   function buildLevel() {
     var s = api.project.snapshot();
@@ -381,13 +506,19 @@ window.__bdgPluginRegister(function activate(api) {
 
     var built = buildAngleData(beats, counts, multiPlan, multAt, twirlSet);
     var actions = buildActions(beats, built.beatFloor, multAt);
-    actions = actions.concat(buildSetSpeed(beats, built.beatFloor, bpmPoints, baseBpm));
+    actions = actions.concat(buildSetSpeed(beats, built.beatFloor, bpmPoints, baseBpm, settings));
     actions = actions.concat(buildTwirl(beats, built.beatFloor, twirlSet));
     actions.sort(function (a, b) {
       if (a.floor !== b.floor) return a.floor - b.floor;
       var order = { SetSpeed: 0, Twirl: 1, Pause: 2 };
       return (order[a.eventType] || 3) - (order[b.eventType] || 3);
     });
+
+    var idxByBeat = {};
+    for (var bi = 0; bi < beats.length; bi++) idxByBeat[beats[bi]] = bi;
+    var warnings = [];
+    warnings = warnings.concat(checkBpmRange(baseBpm, bpmPoints, built.beatFloor, idxByBeat));
+    warnings = warnings.concat(checkSmallAngles(beats, built.beatFloor, multiPlan, multAt));
 
     return {
       obj: {
@@ -396,6 +527,7 @@ window.__bdgPluginRegister(function activate(api) {
         actions: actions,
         decorations: [],
       },
+      warnings: warnings,
     };
   }
 
@@ -411,6 +543,17 @@ window.__bdgPluginRegister(function activate(api) {
       api.log("adofai export refused:", level.error);
       window.alert("导出被拒绝：\n" + level.error);
       return;
+    }
+    if (level.warnings && level.warnings.length) {
+      for (var wi = 0; wi < level.warnings.length; wi++) {
+        api.log("adofai warn: " + level.warnings[wi]);
+      }
+      var shown = level.warnings.slice(0, 20);
+      var msg = "导出检查（仅提醒，不阻拦导出）：\n\n" + shown.join("\n");
+      if (level.warnings.length > shown.length) {
+        msg += "\n… 另有 " + (level.warnings.length - shown.length) + " 处，详见日志。";
+      }
+      window.alert(msg);
     }
     var content = JSON.stringify(level.obj, null, 2);
     api.system
@@ -499,6 +642,70 @@ window.__bdgPluginRegister(function activate(api) {
   });
 
   // 旋转轨道已从 UI 移除（不再可创建），内部 Twirl 生成逻辑保留。
+
+  // ---------------- 面板：导出设置 ----------------
+
+  function panelRow(labelText, control) {
+    var row = document.createElement("label");
+    row.style.display = "flex";
+    row.style.alignItems = "center";
+    row.style.gap = "8px";
+    row.style.margin = "6px 0";
+    var span = document.createElement("span");
+    span.textContent = labelText;
+    span.style.flex = "1";
+    row.appendChild(span);
+    row.appendChild(control);
+    return row;
+  }
+
+  api.ui.registerPanel({
+    id: "adofai-config",
+    title: { zh: "ADOFAI 导出设置", en: "ADOFAI Export Options" },
+    mount: function mount(host) {
+      host.textContent = "";
+
+      var wrap = document.createElement("div");
+      wrap.style.padding = "4px 2px";
+      host.appendChild(wrap);
+
+      var offsetInput = document.createElement("input");
+      offsetInput.type = "number";
+      offsetInput.step = "1";
+      offsetInput.value = String(config.speedPlaceOffset);
+      offsetInput.style.width = "72px";
+      offsetInput.addEventListener("change", function () {
+        var v = parseFloat(offsetInput.value);
+        config.speedPlaceOffset = isNaN(v) ? 0 : v;
+        offsetInput.value = String(config.speedPlaceOffset);
+        saveConfig();
+        api.log("adofai: speedPlaceOffset ->", config.speedPlaceOffset);
+      });
+      wrap.appendChild(panelRow("变速放置位置偏移 (floor)", offsetInput));
+
+      var pauseFix = document.createElement("input");
+      pauseFix.type = "checkbox";
+      pauseFix.checked = config.pauseFix1;
+      pauseFix.addEventListener("change", function () {
+        config.pauseFix1 = pauseFix.checked;
+        saveConfig();
+        api.log("adofai: pauseFix1 ->", config.pauseFix1);
+      });
+      wrap.appendChild(panelRow("暂停数值修复#1", pauseFix));
+
+      var hint = document.createElement("div");
+      hint.style.opacity = "0.6";
+      hint.style.fontSize = "12px";
+      hint.style.marginTop = "8px";
+      hint.textContent =
+        "偏移：SetSpeed 的 floor 相加（正数往后挪格）；修复#1：暂停 (1,2)→2、(2,3)→2。";
+      wrap.appendChild(hint);
+
+      return function unmount() {
+        host.textContent = "";
+      };
+    },
+  });
 
   // ---------------- 出口：导出按钮 ----------------
 
