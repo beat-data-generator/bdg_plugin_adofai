@@ -1,0 +1,11 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+jobs:
+  release:
+    uses: beat-data-generator/.github/.github/workflows/release-plugin.yml@main
+    permissions:
+      contents: write
