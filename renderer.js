@@ -86,6 +86,14 @@ window.__bdgPluginRegister(function activate(api) {
     return v;
   }
 
+  // 工程里的 beat 是浮点数，同一位置常出现 25 与 25.000000000000004 这种重复值。
+  // 统一吸附到 1e-6 精度，避免被当成两个 beat：否则第二个 beat 的差值 ≈0，
+  // 生成 step=180° 的“回头/整圈”块，游戏按 360°（2 拍）播放，导致后续整体后移。
+  function snapBeat(v) {
+    return Math.round(v * 1e6) / 1e6;
+  }
+
+
   // 中旋写法 [X₁,999,X₂,999,…,原格] 的参数（见 core/dp_midspin.py）：
   //   MIDSPIN    999 → 0 拍、出角=入角，与下一格同一瞬间按下
   //   DP_MIN_TRAVEL 原格 travel 被吃掉 Σsᵢ 后不能低于此值，否则成回头方块
@@ -144,7 +152,7 @@ window.__bdgPluginRegister(function activate(api) {
       var m = s.markers[i];
       var track = findTrack(s, m.trackId);
       if (isBpmTrack(track) || isMultiTrack(track)) continue;
-      var beat = m.beat;
+      var beat = snapBeat(m.beat);
       if (beat in counts) counts[beat]++;
       else counts[beat] = 1;
     }
@@ -168,7 +176,7 @@ window.__bdgPluginRegister(function activate(api) {
       var maxKeys = Number(attrs.maxKeys != null ? attrs.maxKeys : 3);
       var angle = Number(attrs.angle != null ? attrs.angle : 15);
       if (!(maxKeys >= 2)) maxKeys = 2;
-      plan[m.beat] = { multiType: multiType, maxKeys: maxKeys, angle: angle };
+      plan[snapBeat(m.beat)] = { multiType: multiType, maxKeys: maxKeys, angle: angle };
     }
     return plan;
   }
@@ -180,7 +188,7 @@ window.__bdgPluginRegister(function activate(api) {
       var track = findTrack(s, m.trackId);
       if (isBpmTrack(track) && m.attrs) {
         out.push({
-          beat: m.beat,
+          beat: snapBeat(m.beat),
           type: m.attrs.speedType,
           value: Number(m.attrs.value),
         });
@@ -197,7 +205,7 @@ window.__bdgPluginRegister(function activate(api) {
     for (var i = 0; i < s.markers.length; i++) {
       var m = s.markers[i];
       var track = findTrack(s, m.trackId);
-      if (isTwirlTrack(track)) set[m.beat] = true;
+      if (isTwirlTrack(track)) set[snapBeat(m.beat)] = true;
     }
     return set;
   }
@@ -406,11 +414,16 @@ window.__bdgPluginRegister(function activate(api) {
     return out;
   }
 
-  // 导出检查（仅提醒，不阻拦）②：多押/中旋模式下，某块的夹角（travel）小于该点的多押角度。
-  //   夹角 = |180 − step|（直线 = 180°，回头 = 0°）。
-  function checkSmallAngles(beats, beatFloor, multiPlan, multAt) {
+  // 导出检查（仅提醒，不阻拦）②：真·多押 beat 上的有效 travel 小于该点多押角度。
+  //   travel = diffEff × 180（有效拍数 × 180°，直线 1 拍 = 180°；
+  //   不能用 |180 − step|：diffEff 为偶数整拍时 step 会 wrap，得出假的 travel=0）。
+  //   只在「当前状态是多押/中旋」且「该 beat 确实有 ≥2 个音砖」时检查——
+  //   普通单押 beat 不插多押块，与其多押角度无关。
+  //   连续异常段合并：距上次报警超过 1 拍才再报一次，每次只报该处当前的 travel（非累计）。
+  function checkSmallAngles(beats, counts, beatFloor, multiPlan, multAt) {
     var out = [];
     var state = { multiType: "single", maxKeys: 3, angle: 15 };
+    var lastWarnBeat = null;
     for (var j = 0; j < beats.length; j++) {
       var mp = multiPlan[beats[j]];
       if (mp) state = { multiType: mp.multiType, maxKeys: mp.maxKeys, angle: mp.angle };
@@ -418,13 +431,16 @@ window.__bdgPluginRegister(function activate(api) {
       var diff = beats[j] - beats[j - 1];
       var mult = multAt(beats[j - 1]);
       var diffEff = diff * mult;
-      var step = wrap360((1 - diffEff) * 180);
-      var travel = Math.abs(180 - step);
-      if (state.multiType !== "single" && travel < state.angle - 1e-9) {
-        out.push(
-          "夹角 beat " + beats[j] + "（floor " + beatFloor[j] + "）：travel " +
-            round2(travel) + "° < 多押角度 " + state.angle + "°，请检查。",
-        );
+      var travel = diffEff * 180;
+      var isMultiBeat = (counts[beats[j]] || 1) >= 2;
+      if (state.multiType !== "single" && isMultiBeat && travel < state.angle - 1e-9) {
+        if (lastWarnBeat === null || beats[j] - lastWarnBeat > 1) {
+          out.push(
+            "夹角 beat " + beats[j] + "（floor " + beatFloor[j] + "）：travel " +
+              round2(travel) + "° < 多押角度 " + state.angle + "°，请检查。",
+          );
+          lastWarnBeat = beats[j];
+        }
       }
     }
     return out;
@@ -518,7 +534,7 @@ window.__bdgPluginRegister(function activate(api) {
     for (var bi = 0; bi < beats.length; bi++) idxByBeat[beats[bi]] = bi;
     var warnings = [];
     warnings = warnings.concat(checkBpmRange(baseBpm, bpmPoints, built.beatFloor, idxByBeat));
-    warnings = warnings.concat(checkSmallAngles(beats, built.beatFloor, multiPlan, multAt));
+    warnings = warnings.concat(checkSmallAngles(beats, counts, built.beatFloor, multiPlan, multAt));
 
     return {
       obj: {
