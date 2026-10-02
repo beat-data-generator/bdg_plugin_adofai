@@ -129,6 +129,11 @@ interface PluginApi {
       moveMarker: (id: string, beat: number) => boolean;
       removeMarker: (id: string) => void;
       setMarkerAttrs: (id: string, attrs: Record<string, unknown>) => void;
+      /** Set a main marker's loop group config (undo aware); null clears it. */
+      setMarkerLoop: (
+        id: string,
+        cfg: { interval: number; count: number; exclude?: number[] } | null,
+      ) => void;
       addBpmPoint: (beat: number) => string | null;
       removeBpmPoint: (id: string) => void;
       setBaseBpm: (v: number) => void;
@@ -218,6 +223,8 @@ interface PluginApi {
       height?: number;
     }) => Promise<void>;
     openPluginsFolder: () => Promise<void>;
+    /** Absolute filesystem path of the loaded audio, or null when none. */
+    audioPath: () => string | null;
   };
 
   /** Route a free-form call to this plugin's main.js handler. */
