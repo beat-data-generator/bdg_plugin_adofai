@@ -100,13 +100,20 @@ window.__bdgPluginRegister(function activate(api) {
   var MIDSPIN = 999;
   var DP_MIN_TRAVEL = 15;
 
+  // 双押旋转（测试功能）定义：multiType==="multi" 且押数=2 时，在插入块所在格放一个
+  // Twirl，并从该格起翻转 angleData 的角度符号（dir 镜像）。
+  //   floorOffset：Twirl 落在「该 beat 原格」之后的第几个插入格（1 = 紧邻的插入块）。
+  //   flipDir    ：从该格起是否翻转 dir（true = 角度取负，parity 翻转）。
+  // 改这里即可调整测试口径。
+  var DOUBLE_PRESS_TWIRL = { floorOffset: 1, flipDir: true };
+
   var bpmKey = api.id + ":bpm";
   var multiKey = api.id + ":multi";
   var twirlKey = api.id + ":twirl";
 
   // 面板设置：变速放置位置偏移（floor 相加，正数往后挪格）、暂停数值修复#1。
   var CONFIG_KEY = api.id + ":config";
-  var config = { speedPlaceOffset: 1, pauseFix1: true };
+  var config = { speedPlaceOffset: 1, pauseFix1: true, doublePressTwirl: false };
   try {
     var savedConfig = localStorage.getItem(CONFIG_KEY);
     if (savedConfig) {
@@ -116,6 +123,8 @@ window.__bdgPluginRegister(function activate(api) {
           config.speedPlaceOffset = parsedConfig.speedPlaceOffset;
         if (typeof parsedConfig.pauseFix1 === "boolean")
           config.pauseFix1 = parsedConfig.pauseFix1;
+        if (typeof parsedConfig.doublePressTwirl === "boolean")
+          config.doublePressTwirl = parsedConfig.doublePressTwirl;
       }
     }
   } catch (e) {
@@ -228,6 +237,7 @@ window.__bdgPluginRegister(function activate(api) {
   function buildAngleData(beats, counts, multiPlan, multAt, twirlSet) {
     var angleData = [];
     var beatFloor = [];
+    var dpTwirlFloors = []; // 双押旋转（测试）：额外生成的 Twirl 事件 floor
     var current = 0;
     var carry = 0;
     var dir = 1;
@@ -307,9 +317,16 @@ window.__bdgPluginRegister(function activate(api) {
         if (blocks < 1) blocks = 1;
       }
       if (blocks > 0) {
+        // 双押旋转（测试）：真·双押（multi + 押数=2）时，按 DOUBLE_PRESS_TWIRL 在
+        // 插入块所在格放 Twirl，并从该格起翻转 dir 镜像。
+        var dpTwirl = config.doublePressTwirl && pressCount === 2;
+        if (dpTwirl && DOUBLE_PRESS_TWIRL.flipDir) dir = -dir;
         for (var q = 0; q < blocks; q++) {
           current = wrap360(current + (180 - state.angle)); // 插入块夹角 180−angle
           angleData.push(dir * current);
+        }
+        if (dpTwirl) {
+          dpTwirlFloors.push(beatFloor[j] + DOUBLE_PRESS_TWIRL.floorOffset);
         }
         carry = state.angle * blocks; // 下一块补 Σ(每块 angle)（累加回正）
         panelLog(
@@ -317,11 +334,12 @@ window.__bdgPluginRegister(function activate(api) {
             " 押数=" + pressCount +
             " blocks=" + blocks +
             " angle=" + state.angle +
-            " carry=" + carry,
+            " carry=" + carry +
+            (dpTwirl ? " 双押旋转->floor " + (beatFloor[j] + DOUBLE_PRESS_TWIRL.floorOffset) : ""),
         );
       }
     }
-    return { angleData: angleData, beatFloor: beatFloor };
+    return { angleData: angleData, beatFloor: beatFloor, dpTwirlFloors: dpTwirlFloors };
   }
 
   // Pause 时长按拍计（引擎把 duration 看作等待拍数）。相邻 floor 自占 1 拍，
@@ -524,6 +542,10 @@ window.__bdgPluginRegister(function activate(api) {
     var actions = buildActions(beats, built.beatFloor, multAt);
     actions = actions.concat(buildSetSpeed(beats, built.beatFloor, bpmPoints, baseBpm, settings));
     actions = actions.concat(buildTwirl(beats, built.beatFloor, twirlSet));
+    for (var dp = 0; dp < built.dpTwirlFloors.length; dp++) {
+      actions.push({ floor: built.dpTwirlFloors[dp], eventType: "Twirl" });
+      panelLog("Twirl(双押旋转测试): floor " + built.dpTwirlFloors[dp]);
+    }
     actions.sort(function (a, b) {
       if (a.floor !== b.floor) return a.floor - b.floor;
       var order = { SetSpeed: 0, Twirl: 1, Pause: 2 };
@@ -709,12 +731,23 @@ window.__bdgPluginRegister(function activate(api) {
       });
       wrap.appendChild(panelRow("暂停数值修复#1", pauseFix));
 
+      var dpTwirlToggle = document.createElement("input");
+      dpTwirlToggle.type = "checkbox";
+      dpTwirlToggle.checked = config.doublePressTwirl;
+      dpTwirlToggle.addEventListener("change", function () {
+        config.doublePressTwirl = dpTwirlToggle.checked;
+        saveConfig();
+        api.log("adofai: doublePressTwirl ->", config.doublePressTwirl);
+      });
+      wrap.appendChild(panelRow("双押旋转（测试）", dpTwirlToggle));
+
       var hint = document.createElement("div");
       hint.style.opacity = "0.6";
       hint.style.fontSize = "12px";
       hint.style.marginTop = "8px";
       hint.textContent =
-        "偏移：SetSpeed 的 floor 相加（正数往后挪格）；修复#1：暂停 (1,2)→2、(2,3)→2。";
+        "偏移：SetSpeed 的 floor 相加（正数往后挪格）；修复#1：暂停 (1,2)→2、(2,3)→2；" +
+        "双押旋转（测试）：多押(multi) 且押数=2 时，在插入块所在格生成 Twirl 并翻转角度符号。";
       wrap.appendChild(hint);
 
       return function unmount() {

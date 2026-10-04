@@ -42,6 +42,7 @@
 
 - **变速放置位置偏移**（默认 `1`）：生成的 `SetSpeed` 事件 `floor += 偏移`（正数往后挪格）；`floor ≤ 0` 仍按 floor 0 规则写进 `settings.bpm`。
 - **暂停数值修复#1**（默认开）：对 `Pause` 的 `duration` 做修正 —— `(1,2)` 向上取整为 `2`，`(2,3)` 向下取整为 `2`；关闭则保持 `diffEff − 1`。
+- **双押旋转（测试）**（默认关）：多押轨道 `multiType = multi` 且该 beat 押数 `= 2` 时，在插入块所在格（原格 `+ 1`）生成一个 `Twirl`，并从该格起翻转 `angleData` 的角度符号（`dir` 镜像）。口径由代码常量 `DOUBLE_PRESS_TWIRL = { floorOffset, flipDir }` 定义。
 
 ### 导出检查（仅提醒，不阻拦导出）
 
