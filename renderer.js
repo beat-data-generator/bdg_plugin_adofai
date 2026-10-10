@@ -112,30 +112,19 @@ window.__bdgPluginRegister(function activate(api) {
   var twirlKey = api.id + ":twirl";
 
   // 面板设置：变速放置位置偏移（floor 相加，正数往后挪格）、暂停数值修复#1。
-  var CONFIG_KEY = api.id + ":config";
-  var config = { speedPlaceOffset: 1, pauseFix1: true, doublePressTwirl: false };
-  try {
-    var savedConfig = localStorage.getItem(CONFIG_KEY);
-    if (savedConfig) {
-      var parsedConfig = JSON.parse(savedConfig);
-      if (parsedConfig && typeof parsedConfig === "object") {
-        if (typeof parsedConfig.speedPlaceOffset === "number")
-          config.speedPlaceOffset = parsedConfig.speedPlaceOffset;
-        if (typeof parsedConfig.pauseFix1 === "boolean")
-          config.pauseFix1 = parsedConfig.pauseFix1;
-        if (typeof parsedConfig.doublePressTwirl === "boolean")
-          config.doublePressTwirl = parsedConfig.doublePressTwirl;
-      }
-    }
-  } catch (e) {
-    api.log("adofai: load config failed:", e);
+  // v2: 用 api.storage（按插件隔离、主进程落盘）替代 localStorage。
+  var CONFIG_KEY = "config";
+  var config = api.storage.get(CONFIG_KEY, null);
+  if (!config || typeof config !== "object") {
+    config = { speedPlaceOffset: 1, pauseFix1: true, doublePressTwirl: false };
+  } else {
+    if (typeof config.speedPlaceOffset !== "number") config.speedPlaceOffset = 1;
+    if (typeof config.pauseFix1 !== "boolean") config.pauseFix1 = true;
+    if (typeof config.doublePressTwirl !== "boolean")
+      config.doublePressTwirl = false;
   }
   function saveConfig() {
-    try {
-      localStorage.setItem(CONFIG_KEY, JSON.stringify(config));
-    } catch (e) {
-      api.log("adofai: save config failed:", e);
-    }
+    api.storage.set(CONFIG_KEY, config);
   }
 
   function findTrack(s, tid) {
@@ -579,7 +568,10 @@ window.__bdgPluginRegister(function activate(api) {
     var level = buildLevel();
     if (level.error) {
       api.log("adofai export refused:", level.error);
-      window.alert("导出被拒绝：\n" + level.error);
+      api.ui.notify({
+        message: "导出被拒绝：" + level.error,
+        type: "error",
+      });
       return;
     }
     if (level.warnings && level.warnings.length) {
@@ -587,11 +579,11 @@ window.__bdgPluginRegister(function activate(api) {
         api.log("adofai warn: " + level.warnings[wi]);
       }
       var shown = level.warnings.slice(0, 20);
-      var msg = "导出检查（仅提醒，不阻拦导出）：\n\n" + shown.join("\n");
+      var msg = "导出检查（仅提醒，不阻拦导出）：" + shown.join("；");
       if (level.warnings.length > shown.length) {
-        msg += "\n… 另有 " + (level.warnings.length - shown.length) + " 处，详见日志。";
+        msg += "；另有 " + (level.warnings.length - shown.length) + " 处，详见日志。";
       }
-      window.alert(msg);
+      api.ui.notify({ message: msg, type: "warning", durationMs: 8000 });
     }
     var content = JSON.stringify(level.obj, null, 2);
     api.system

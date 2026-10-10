@@ -1,6 +1,7 @@
 {
   "id": "dev.bdg.adofai-export",
-  "version": "0.1.2",
+  "version": "0.2.0",
+  "apiVersion": 2,
   "name": {
     "zh": "ADOFAI 导出",
     "en": "ADOFAI Export"
