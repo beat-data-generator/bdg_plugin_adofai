@@ -166,7 +166,8 @@ window.__bdgPluginRegister(function activate(api) {
       config.normalizeAngles = false;
     if (typeof config.rapidRuns !== "boolean") config.rapidRuns = false;
     if (typeof config.fakeLanes !== "boolean") config.fakeLanes = false;
-    if (typeof config.laneGap !== "number") config.laneGap = 0.5;
+    if (typeof config.laneGap !== "number" || config.laneGap <= 0)
+      config.laneGap = 0.5;
     if (typeof config.spacingX !== "number") config.spacingX = 0;
   }
   function saveConfig() {
@@ -439,9 +440,12 @@ window.__bdgPluginRegister(function activate(api) {
       for (var kk = 1; kk < angleData.length; kk++) {
         if (angleData[kk] === MIDSPIN || angleData[kk - 1] === MIDSPIN) continue;
         var dk = angleData[kk] - angleData[kk - 1];
-        var sdk = (((dk % 360) + 540) % 360) - 180; // 归一到 (-180,180]
+        var sdk = (((dk % 360) + 540) % 360) - 180; // 归一到 [-180,180)
         if (Math.abs(Math.abs(sdk) - 180) < 0.5) {
-          if (hairpinSign === 0) hairpinSign = sdk >= 0 ? 1 : -1;
+          // 180° 在取模后 ±180 等价；先保留原始差值方向，再统一成首次出现的符号，
+          // 否则 sdk 恒为 -180，hairpinSign 永远取不到 +1。
+          sdk = dk >= 0 ? 180 : -180;
+          if (hairpinSign === 0) hairpinSign = sdk > 0 ? 1 : -1;
           angleData[kk] = angleData[kk - 1] + hairpinSign * 180;
         } else {
           angleData[kk] = angleData[kk - 1] + sdk;
@@ -716,7 +720,8 @@ window.__bdgPluginRegister(function activate(api) {
     var firstBeat = beats[0];
     var totalBeats = Math.max(1e-6, beats[beats.length - 1] - firstBeat);
 
-    // 一个四分音符（1 拍）对应的横向间隔：默认按工程总长自动选，让整段铺开约 80 格
+    // 一个四分音符（1 拍）对应的横向间隔：自动模式下以铺开约 80 格为目标，
+    // 但单拍间隔限制在 0.2–1 格，避免短工程被拉得过开。
     var spacingX =
       config.spacingX > 0
         ? config.spacingX
@@ -1090,7 +1095,16 @@ window.__bdgPluginRegister(function activate(api) {
         return api.system.writeText(res.filePath, content);
       })
       .then(function (ok) {
-        if (!ok || !savedPath) return;
+        if (!savedPath) return; // 用户取消保存
+        if (!ok) {
+          api.log("adofai export:", "write failed");
+          api.ui.notify({
+            message: "关卡文件写入失败。",
+            type: "error",
+            durationMs: 8000,
+          });
+          return;
+        }
         api.log("adofai export:", "saved");
         // 装饰素材写到关卡同目录（decorationImage 按关卡目录解析）
         var dir = String(savedPath).replace(/[\\/][^\\/]*$/, "");
@@ -1309,7 +1323,7 @@ window.__bdgPluginRegister(function activate(api) {
       gapInput.style.width = "72px";
       gapInput.addEventListener("change", function () {
         var v = parseFloat(gapInput.value);
-        config.laneGap = isNaN(v) ? 1.5 : v;
+        config.laneGap = isNaN(v) || v <= 0 ? 0.5 : v;
         gapInput.value = String(config.laneGap);
         saveConfig();
         api.log("adofai: laneGap ->", config.laneGap);
@@ -1340,7 +1354,7 @@ window.__bdgPluginRegister(function activate(api) {
         "修复#2：修复#1 后仍 > 2 拍时再减 1 拍；" +
         "自动 Twirl：开启后按最终 angleData 生成，并忽略手动 Twirl 轨道；" +
         "快速跑动：8 分三角、6 分三角、16/32 分之字、12/24 分同号；" +
-        "装饰泳道：按轨道颜色生成菱形 + 行星，另含小节线与红色播放头（1 拍 = 1 格）；" +
+        "装饰泳道：按轨道颜色生成菱形 + 行星，另含小节线与红色播放头（横向间隔见设置）；" +
         "泳道间距越小越紧凑（默认 0.5 格）。" +
         "近整拍吸附：拍差距整数 ≤ 0.05 时按整拍计算，消除几度的弯曲。" +
         "发卡弯同号 / 闭环朝上：把发卡弯统一同号并镜像朝下的闭环段（会改变形态）。";
