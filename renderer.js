@@ -1,4 +1,4 @@
-﻿window.__bdgPluginRegister(function activate(api) {
+window.__bdgPluginRegister(function activate(api) {
   api.log("renderer entry activated (id=" + api.id + ")");
 
   var DEFAULT_SETTINGS = {
@@ -119,7 +119,7 @@
     out[0] = 0;
     for (var j = 1; j < beats.length; j++) {
       var raw = beats[j] - beats[j - 1];
-      var snapped = snapDiff(raw, gridDiv);
+      var snapped = config.snapNearInt ? snapDiff(raw, gridDiv) : raw;
       out[j] = snapped;
       if (snapped !== raw) {
         panelLog(
@@ -148,14 +148,29 @@
   // v2: 用 api.storage（按插件隔离、主进程落盘）替代 localStorage。
   var CONFIG_KEY = "config";
   var config = api.storage.get(CONFIG_KEY, null);
+  // 新增的启发式默认全关，避免升级后静默改变既有工程的导出结果。
   if (!config || typeof config !== "object") {
-    config = { speedPlaceOffset: 1, pauseFix1: true, doublePressTwirl: false, fakeLanes: true, laneGap: 0.5, spacingX: 0 };
+    config = {
+      speedPlaceOffset: 1,
+      pauseFix1: true,
+      pauseFix2: false,
+      doublePressTwirl: false,
+      snapNearInt: false,
+      normalizeAngles: false,
+      fakeLanes: false,
+      laneGap: 0.5,
+      spacingX: 0,
+    };
   } else {
     if (typeof config.speedPlaceOffset !== "number") config.speedPlaceOffset = 1;
     if (typeof config.pauseFix1 !== "boolean") config.pauseFix1 = true;
+    if (typeof config.pauseFix2 !== "boolean") config.pauseFix2 = false;
     if (typeof config.doublePressTwirl !== "boolean")
       config.doublePressTwirl = false;
-    if (typeof config.fakeLanes !== "boolean") config.fakeLanes = true;
+    if (typeof config.snapNearInt !== "boolean") config.snapNearInt = false;
+    if (typeof config.normalizeAngles !== "boolean")
+      config.normalizeAngles = false;
+    if (typeof config.fakeLanes !== "boolean") config.fakeLanes = false;
     if (typeof config.laneGap !== "number") config.laneGap = 0.5;
     if (typeof config.spacingX !== "number") config.spacingX = 0;
   }
@@ -262,7 +277,7 @@
   function buildAngleData(beats, counts, multiPlan, multAt, twirlSet, diffTable) {
     var angleData = [];
     var beatFloor = [];
-    var dpTwirlFloors = []; // 多押旋转（测试）：额外生成的 Twirl 事件 floor
+    var dpTwirlFloors = []; // 自动 Twirl（测试）：额外生成的 Twirl 事件 floor
     var current = 0;
     var carry = 0;
     var dir = 1;
@@ -419,72 +434,76 @@
         );
       }
     }
-    // 收尾：把角度改成【连续不 wrap】，并让所有发卡弯（|转角|≈180°）强制同号。
-    // 否则 0,180,0,180 在有符号转角下是 +180/-180 交替，游戏会把连续回头块按 1/2 拍交替播放。
-    var hairpinSign = 0;
-    for (var kk = 1; kk < angleData.length; kk++) {
-      if (angleData[kk] === MIDSPIN || angleData[kk - 1] === MIDSPIN) continue;
-      var dk = angleData[kk] - angleData[kk - 1];
-      var sdk = (((dk % 360) + 540) % 360) - 180; // 归一到 (-180,180]
-      if (Math.abs(Math.abs(sdk) - 180) < 0.5) {
-        if (hairpinSign === 0) hairpinSign = sdk >= 0 ? 1 : -1;
-        angleData[kk] = angleData[kk - 1] + hairpinSign * 180;
-      } else {
-        angleData[kk] = angleData[kk - 1] + sdk;
+    // 发卡弯同号 + 闭环朝上：实验性启发式，默认关闭。
+    // 开启后会整体改写 angleData（改变谱面形态），因此必须由用户显式启用。
+    if (config.normalizeAngles) {
+      // 收尾：把角度改成【连续不 wrap】，并让所有发卡弯（|转角|≈180°）强制同号。
+      // 否则 0,180,0,180 在有符号转角下是 +180/-180 交替，游戏会把连续回头块按 1/2 拍交替播放。
+      var hairpinSign = 0;
+      for (var kk = 1; kk < angleData.length; kk++) {
+        if (angleData[kk] === MIDSPIN || angleData[kk - 1] === MIDSPIN) continue;
+        var dk = angleData[kk] - angleData[kk - 1];
+        var sdk = (((dk % 360) + 540) % 360) - 180; // 归一到 (-180,180]
+        if (Math.abs(Math.abs(sdk) - 180) < 0.5) {
+          if (hairpinSign === 0) hairpinSign = sdk >= 0 ? 1 : -1;
+          angleData[kk] = angleData[kk - 1] + hairpinSign * 180;
+        } else {
+          angleData[kk] = angleData[kk - 1] + sdk;
+        }
       }
-    }
 
-    // 恒定向上：折返/跑动常形成“闭环段”（段内累计转角回到同一朝向，如 +165,+105,+90=360）。
-    // 段内所有转角取反 = 沿水平轴镜像，幅值不变（时序不变），把朝下的峰翻成朝上。
-    // 实现：先把转角抽成 delta 表，在 delta 上取反，最后整条重建，
-    // 避免“段尾平移”制造假转角（否则会一路放大成异形）。
-    var mirrorDeltas = new Array(angleData.length);
-    mirrorDeltas[0] = 0;
-    for (var md = 1; md < angleData.length; md++) {
-      mirrorDeltas[md] =
-        angleData[md] === MIDSPIN || angleData[md - 1] === MIDSPIN
-          ? null
-          : angleData[md] - angleData[md - 1];
-    }
-    var mirrorAt = 1;
-    while (mirrorAt < angleData.length) {
-      if (mirrorDeltas[mirrorAt] === null) {
-        mirrorAt++;
-        continue;
+      // 恒定向上：折返/跑动常形成“闭环段”（段内累计转角回到同一朝向，如 +165,+105,+90=360）。
+      // 段内所有转角取反 = 沿水平轴镜像，幅值不变（时序不变），把朝下的峰翻成朝上。
+      // 实现：先把转角抽成 delta 表，在 delta 上取反，最后整条重建，
+      // 避免“段尾平移”制造假转角（否则会一路放大成异形）。
+      var mirrorDeltas = new Array(angleData.length);
+      mirrorDeltas[0] = 0;
+      for (var md = 1; md < angleData.length; md++) {
+        mirrorDeltas[md] =
+          angleData[md] === MIDSPIN || angleData[md - 1] === MIDSPIN
+            ? null
+            : angleData[md] - angleData[md - 1];
       }
-      var acc = 0;
-      var segEnd = -1;
-      for (var q = mirrorAt; q < angleData.length && q <= mirrorAt + 16; q++) {
-        if (mirrorDeltas[q] === null) break;
-        var dq = mirrorDeltas[q];
-        if (Math.abs(dq) < 30) break; // 进入普通直行/整拍段
-        acc += dq;
-        var am = Math.abs(acc % 360);
-        if (Math.abs(acc) >= 300 && (am < 1 || Math.abs(am - 360) < 1)) {
-          segEnd = q;
-          break;
+      var mirrorAt = 1;
+      while (mirrorAt < angleData.length) {
+        if (mirrorDeltas[mirrorAt] === null) {
+          mirrorAt++;
+          continue;
+        }
+        var acc = 0;
+        var segEnd = -1;
+        for (var q = mirrorAt; q < angleData.length && q <= mirrorAt + 16; q++) {
+          if (mirrorDeltas[q] === null) break;
+          var dq = mirrorDeltas[q];
+          if (Math.abs(dq) < 30) break; // 进入普通直行/整拍段
+          acc += dq;
+          var am = Math.abs(acc % 360);
+          if (Math.abs(acc) >= 300 && (am < 1 || Math.abs(am - 360) < 1)) {
+            segEnd = q;
+            break;
+          }
+        }
+        if (segEnd > mirrorAt) {
+          // 用段内原始朝向判断是否整体朝下
+          var sumSin = 0;
+          var hv = angleData[mirrorAt - 1];
+          for (var q2 = mirrorAt; q2 <= segEnd; q2++) {
+            hv += mirrorDeltas[q2];
+            sumSin += Math.sin(((hv % 360) * Math.PI) / 180);
+          }
+          if (sumSin < -1e-6) {
+            for (var q3 = mirrorAt; q3 <= segEnd; q3++) mirrorDeltas[q3] = -mirrorDeltas[q3];
+          }
+          mirrorAt = segEnd + 1;
+        } else {
+          mirrorAt++;
         }
       }
-      if (segEnd > mirrorAt) {
-        // 用段内原始朝向判断是否整体朝下
-        var sumSin = 0;
-        var hv = angleData[mirrorAt - 1];
-        for (var q2 = mirrorAt; q2 <= segEnd; q2++) {
-          hv += mirrorDeltas[q2];
-          sumSin += Math.sin(((hv % 360) * Math.PI) / 180);
-        }
-        if (sumSin < -1e-6) {
-          for (var q3 = mirrorAt; q3 <= segEnd; q3++) mirrorDeltas[q3] = -mirrorDeltas[q3];
-        }
-        mirrorAt = segEnd + 1;
-      } else {
-        mirrorAt++;
+      // 整条重建：连续、无假转角
+      for (var rb = 1; rb < angleData.length; rb++) {
+        if (mirrorDeltas[rb] === null) continue;
+        angleData[rb] = angleData[rb - 1] + mirrorDeltas[rb];
       }
-    }
-    // 整条重建：连续、无假转角
-    for (var rb = 1; rb < angleData.length; rb++) {
-      if (mirrorDeltas[rb] === null) continue;
-      angleData[rb] = angleData[rb - 1] + mirrorDeltas[rb];
     }
 
     // ── Twirl 统一生成（按最终 angleData 计算，与用户期望文件逐 floor 完全一致）：
@@ -497,9 +516,11 @@
       for (var ti = 1; ti < angleData.length; ti++) {
         if (angleData[ti] === MIDSPIN || angleData[ti - 1] === MIDSPIN) continue;
         var td = angleData[ti] - angleData[ti - 1];
-        var atd = Math.abs(td);
+        // 无论上面是否做了“连续不 wrap”，都先归一到 (-180,180] 再判断。
+        var tdn = (((td % 360) + 540) % 360) - 180;
+        var atd = Math.abs(tdn);
         if (atd >= 90 - 1e-6 && atd < 179.5) {
-          var ts = td > 0 ? 1 : -1;
+          var ts = tdn > 0 ? 1 : -1;
           if (ts !== lastTwSign) {
             dpTwirlFloors.push(ti);
             lastTwSign = ts;
@@ -513,9 +534,8 @@
 
   // Pause 时长按拍计（引擎把 duration 看作等待拍数）。普通相邻块自占 1 拍，
   // 故填补有效间距 diffEff 需等待 diffEff − 1 拍。
-  // 但发卡弯（回头块 180°）游戏按 360°（2 拍）播放，自身多占 1 拍，
-  // 此时应等待 diffEff − 2 拍，否则会多停一拍。
-  function buildActions(beats, beatFloor, multAt, diffTable, angleData) {
+  // 修复#2（默认关）：部分回头/大间隔谱面实测会多停 1 拍，开启后 dur > 2 时再减 1。
+  function buildActions(beats, beatFloor, multAt, diffTable) {
     var actions = [];
     for (var j = 0; j < beats.length - 1; j++) {
       var diff = diffTable[j + 1];
@@ -528,8 +548,8 @@
           if (dur > 1 && dur < 2) dur = 2;
           else if (dur > 2 && dur < 3) dur = 2;
         }
-        // 暂停拍数 > 2 时，实测会多停 1 拍 → 减 1 拍。
-        if (dur > 2) dur -= 1;
+        // 暂停拍数 > 2 时，实测可能多停 1 拍 → 可选减 1 拍（修复#2，默认关）。
+        if (config.pauseFix2 && dur > 2) dur -= 1;
         actions.push({
           floor: beatFloor[j + 1],
           eventType: "Pause",
@@ -978,20 +998,24 @@
 
     var diffTable = buildDiffTable(beats, Number(s.gridDiv) || 0);
     var built = buildAngleData(beats, counts, multiPlan, multAt, twirlSet, diffTable);
-    var actions = buildActions(beats, built.beatFloor, multAt, diffTable, built.angleData);
+    var actions = buildActions(beats, built.beatFloor, multAt, diffTable);
     actions = actions.concat(buildSetSpeed(beats, built.beatFloor, bpmPoints, baseBpm, settings));
     actions = actions.concat(buildTwirl(beats, built.beatFloor, twirlSet));
     for (var dp = 0; dp < built.dpTwirlFloors.length; dp++) {
       actions.push({ floor: built.dpTwirlFloors[dp], eventType: "Twirl" });
-      panelLog("Twirl(多押旋转): floor " + built.dpTwirlFloors[dp]);
+      panelLog("Twirl(自动): floor " + built.dpTwirlFloors[dp]);
     }
     // 装饰泳道（含小节线 / 播放头动作）；小节默认 4 拍
     var decoPack = buildDecorations(s, built.beatFloor, beats, built.angleData, 4);
     actions = actions.concat(decoPack.actions);
     actions.sort(function (a, b) {
       if (a.floor !== b.floor) return a.floor - b.floor;
-      var order = { SetSpeed: 0, Twirl: 1, Pause: 2 };
-      return (order[a.eventType] || 3) - (order[b.eventType] || 3);
+      var order = { SetSpeed: 0, Twirl: 1, Pause: 2, MoveDecorations: 3 };
+      var oa = order[a.eventType];
+      var ob = order[b.eventType];
+      if (oa == null) oa = 99;
+      if (ob == null) ob = 99;
+      return oa - ob;
     });
 
     var idxByBeat = {};
@@ -1063,9 +1087,23 @@
           api.system.writeBytes(dir + "/bdg_lane_dot.png", diamondPng(64)),
           api.system.writeBytes(dir + "/bdg_lane_planet.png", planetPng(64)),
           api.system.writeBytes(dir + "/bdg_lane_line.png", linePng(64)),
-        ]).then(function () {
+        ]).then(function (results) {
+          if (results.some(function (r) { return !r; })) {
+            api.log("adofai export: lane png write returned false");
+            api.ui.notify({
+              message: "装饰素材写入失败，关卡中的图片可能缺失。",
+              type: "warning",
+              durationMs: 8000,
+            });
+            return;
+          }
           api.log("adofai export: lane png written");
         });
+      })
+      .catch(function (err) {
+        var msg = err && err.message ? err.message : String(err);
+        api.log("adofai export: failed", msg);
+        api.ui.notify({ message: "导出失败：" + msg, type: "error" });
       });
   }
 
@@ -1191,6 +1229,16 @@
       });
       wrap.appendChild(panelRow("暂停数值修复#1", pauseFix));
 
+      var pauseFix2 = document.createElement("input");
+      pauseFix2.type = "checkbox";
+      pauseFix2.checked = config.pauseFix2;
+      pauseFix2.addEventListener("change", function () {
+        config.pauseFix2 = pauseFix2.checked;
+        saveConfig();
+        api.log("adofai: pauseFix2 ->", config.pauseFix2);
+      });
+      wrap.appendChild(panelRow("暂停数值修复#2（dur>2 减 1 拍）", pauseFix2));
+
       var dpTwirlToggle = document.createElement("input");
       dpTwirlToggle.type = "checkbox";
       dpTwirlToggle.checked = config.doublePressTwirl;
@@ -1199,7 +1247,27 @@
         saveConfig();
         api.log("adofai: doublePressTwirl ->", config.doublePressTwirl);
       });
-      wrap.appendChild(panelRow("多押旋转（测试）", dpTwirlToggle));
+      wrap.appendChild(panelRow("自动 Twirl（测试）", dpTwirlToggle));
+
+      var snapToggle = document.createElement("input");
+      snapToggle.type = "checkbox";
+      snapToggle.checked = config.snapNearInt;
+      snapToggle.addEventListener("change", function () {
+        config.snapNearInt = snapToggle.checked;
+        saveConfig();
+        api.log("adofai: snapNearInt ->", config.snapNearInt);
+      });
+      wrap.appendChild(panelRow("近整拍吸附（测试）", snapToggle));
+
+      var normToggle = document.createElement("input");
+      normToggle.type = "checkbox";
+      normToggle.checked = config.normalizeAngles;
+      normToggle.addEventListener("change", function () {
+        config.normalizeAngles = normToggle.checked;
+        saveConfig();
+        api.log("adofai: normalizeAngles ->", config.normalizeAngles);
+      });
+      wrap.appendChild(panelRow("发卡弯同号 / 闭环朝上（测试）", normToggle));
 
       var lanesToggle = document.createElement("input");
       lanesToggle.type = "checkbox";
@@ -1209,7 +1277,7 @@
         saveConfig();
         api.log("adofai: fakeLanes ->", config.fakeLanes);
       });
-      wrap.appendChild(panelRow("生成装饰泳道", lanesToggle));
+      wrap.appendChild(panelRow("生成装饰泳道（默认关）", lanesToggle));
 
       var gapInput = document.createElement("input");
       gapInput.type = "number";
@@ -1247,9 +1315,11 @@
       hint.style.marginTop = "8px";
       hint.textContent =
         "偏移：SetSpeed 的 floor 相加（正数往后挪格）；修复#1：暂停 (1,2)→2、(2,3)→2；" +
+        "修复#2：暂停拍数 > 2 时再减 1 拍；" +
         "装饰泳道：按轨道颜色生成菱形 + 行星，另含小节线与红色播放头（1 拍 = 1 格）；" +
         "泳道间距越小越紧凑（默认 0.5 格）。" +
-        "近整拍吸附：拍差距整数 ≤ 0.05 且不在网格上时按整拍计算，消除几度的弯曲。";
+        "近整拍吸附：拍差距整数 ≤ 0.05 且不在网格上时按整拍计算，消除几度的弯曲。" +
+        "发卡弯同号 / 闭环朝上：把发卡弯统一同号并镜像朝下的闭环段（会改变形态）。";
       wrap.appendChild(hint);
 
       return function unmount() {
