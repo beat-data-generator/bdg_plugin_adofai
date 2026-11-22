@@ -95,31 +95,24 @@ window.__bdgPluginRegister(function activate(api) {
 
   // 近整拍吸附：踩点若因毫秒取整等原因落在整拍附近（如 0.9668、1.0063 拍），
   // 直接按原始拍差计算会生成几度的“意义不明的弯曲”。这里只吸附距离整数
-  // ≤ 0.05 拍、且原本不在工程网格上的拍差；1/2、1/3、1/4 等正常细分不受影响。
+  // ≤ 0.05 拍的拍差；1/2、1/3、1/4 等正常细分距整数远，不受影响。
   var NEAR_INT_TOL = 0.05;
 
-  function isOnGrid(diff, gridDiv) {
-    if (!(gridDiv > 0)) return false;
-    var k = diff * gridDiv;
-    return Math.abs(k - Math.round(k)) < 1e-6;
-  }
-
-  function snapDiff(diff, gridDiv) {
+  function snapDiff(diff) {
     var r = Math.round(diff);
     if (r < 1) return diff; // 不把 <0.5 的拍差吸成 0
     var delta = Math.abs(diff - r);
     if (delta > NEAR_INT_TOL || delta < 1e-9) return diff;
-    if (isOnGrid(diff, gridDiv)) return diff; // 已在网格上的细分保持原样
     return r;
   }
 
   // 逐拍差只算一次：角度、Pause、夹角检查共用同一份吸附结果，日志也只记一次。
-  function buildDiffTable(beats, gridDiv) {
+  function buildDiffTable(beats) {
     var out = new Array(beats.length);
     out[0] = 0;
     for (var j = 1; j < beats.length; j++) {
       var raw = beats[j] - beats[j - 1];
-      var snapped = config.snapNearInt ? snapDiff(raw, gridDiv) : raw;
+      var snapped = config.snapNearInt ? snapDiff(raw) : raw;
       out[j] = snapped;
       if (snapped !== raw) {
         panelLog(
@@ -137,8 +130,8 @@ window.__bdgPluginRegister(function activate(api) {
   var MIDSPIN = 999;
   var DP_MIN_TRAVEL = 15;
 
-  // 伪双押（multi + 押数=2）：折返方向按当前走向统一朝向；折返格带 Twirl，
-  // 使两次按键都判成同拍（否则会读成“双押→单按两次→双押”的交替）。
+  // 伪双押（multi + 押数=2）：折返方向按当前走向统一朝向。
+  // 是否需要 Twirl 由收尾的自动 Twirl 规则按最终 angleData 统一决定（默认关）。
 
   var bpmKey = api.id + ":bpm";
   var multiKey = api.id + ":multi";
@@ -157,6 +150,7 @@ window.__bdgPluginRegister(function activate(api) {
       doublePressTwirl: false,
       snapNearInt: false,
       normalizeAngles: false,
+      rapidRuns: false,
       fakeLanes: false,
       laneGap: 0.5,
       spacingX: 0,
@@ -170,6 +164,7 @@ window.__bdgPluginRegister(function activate(api) {
     if (typeof config.snapNearInt !== "boolean") config.snapNearInt = false;
     if (typeof config.normalizeAngles !== "boolean")
       config.normalizeAngles = false;
+    if (typeof config.rapidRuns !== "boolean") config.rapidRuns = false;
     if (typeof config.fakeLanes !== "boolean") config.fakeLanes = false;
     if (typeof config.laneGap !== "number") config.laneGap = 0.5;
     if (typeof config.spacingX !== "number") config.spacingX = 0;
@@ -321,6 +316,7 @@ window.__bdgPluginRegister(function activate(api) {
 
       // 快速跑动：按细分形态决定是否换向（三角/之字），12/24 分同号。
       var isRapid =
+        config.rapidRuns &&
         j > 0 &&
         diffEff > 1e-9 &&
         diffEff < 1 - 1e-9 &&
@@ -753,10 +749,12 @@ window.__bdgPluginRegister(function activate(api) {
       }
     }
 
-    // 2) 小节线：每 bpb 拍一条，纵向贯穿所有泳道，以 y=0 居中
+    // 2) 小节线：从 firstBeat 所在小节起，纵向贯穿所有泳道，以 y=0 居中
     var lineScaleY = lineTiles * 100;
-    for (var bb = 0; bb <= totalBeats + 0.001; bb += bpb) {
-      var ln = makeDeco(baseFloor, "bdg_lane_line.png", bb * spacingX, 0, 40, "ffffff");
+    var barStart = Math.floor(firstBeat / bpb) * bpb;
+    var barEnd = firstBeat + totalBeats;
+    for (var bb = barStart; bb <= barEnd + 0.001; bb += bpb) {
+      var ln = makeDeco(baseFloor, "bdg_lane_line.png", xOfBeat(bb), 0, 40, "ffffff");
       ln.scale = [40, lineScaleY];
       ln.opacity = 26;
       decos.push(ln);
@@ -996,14 +994,25 @@ window.__bdgPluginRegister(function activate(api) {
       );
     }
 
-    var diffTable = buildDiffTable(beats, Number(s.gridDiv) || 0);
-    var built = buildAngleData(beats, counts, multiPlan, multAt, twirlSet, diffTable);
+    var diffTable = buildDiffTable(beats);
+    // 自动 Twirl 与手动 Twirl 互斥：自动规则基于最终 angleData 计算，
+    // 若同时计入手动 Twirl 会重复翻转，因此开启自动时忽略手动 Twirl 轨道。
+    var autoTwirl = !!config.doublePressTwirl;
+    var built = buildAngleData(
+      beats, counts, multiPlan, multAt,
+      autoTwirl ? null : twirlSet,
+      diffTable,
+    );
     var actions = buildActions(beats, built.beatFloor, multAt, diffTable);
     actions = actions.concat(buildSetSpeed(beats, built.beatFloor, bpmPoints, baseBpm, settings));
-    actions = actions.concat(buildTwirl(beats, built.beatFloor, twirlSet));
-    for (var dp = 0; dp < built.dpTwirlFloors.length; dp++) {
-      actions.push({ floor: built.dpTwirlFloors[dp], eventType: "Twirl" });
-      panelLog("Twirl(自动): floor " + built.dpTwirlFloors[dp]);
+    if (!autoTwirl) {
+      actions = actions.concat(buildTwirl(beats, built.beatFloor, twirlSet));
+    }
+    if (autoTwirl) {
+      for (var dp = 0; dp < built.dpTwirlFloors.length; dp++) {
+        actions.push({ floor: built.dpTwirlFloors[dp], eventType: "Twirl" });
+        panelLog("Twirl(自动): floor " + built.dpTwirlFloors[dp]);
+      }
     }
     // 装饰泳道（含小节线 / 播放头动作）；小节默认 4 拍
     var decoPack = buildDecorations(s, built.beatFloor, beats, built.angleData, 4);
@@ -1021,6 +1030,9 @@ window.__bdgPluginRegister(function activate(api) {
     var idxByBeat = {};
     for (var bi = 0; bi < beats.length; bi++) idxByBeat[beats[bi]] = bi;
     var warnings = [];
+    if (autoTwirl && Object.keys(twirlSet).length) {
+      warnings.push("自动 Twirl 已开启：手动 Twirl 轨道被忽略");
+    }
     warnings = warnings.concat(checkBpmRange(baseBpm, bpmPoints, built.beatFloor, idxByBeat));
     warnings = warnings.concat(
       checkSmallAngles(beats, counts, built.beatFloor, multiPlan, multAt, diffTable),
@@ -1237,7 +1249,17 @@ window.__bdgPluginRegister(function activate(api) {
         saveConfig();
         api.log("adofai: pauseFix2 ->", config.pauseFix2);
       });
-      wrap.appendChild(panelRow("暂停数值修复#2（dur>2 减 1 拍）", pauseFix2));
+      wrap.appendChild(panelRow("暂停数值修复#2（修复#1 后仍 dur>2 则减 1 拍）", pauseFix2));
+
+      var rapidToggle = document.createElement("input");
+      rapidToggle.type = "checkbox";
+      rapidToggle.checked = config.rapidRuns;
+      rapidToggle.addEventListener("change", function () {
+        config.rapidRuns = rapidToggle.checked;
+        saveConfig();
+        api.log("adofai: rapidRuns ->", config.rapidRuns);
+      });
+      wrap.appendChild(panelRow("快速跑动形态（测试）", rapidToggle));
 
       var dpTwirlToggle = document.createElement("input");
       dpTwirlToggle.type = "checkbox";
@@ -1315,10 +1337,12 @@ window.__bdgPluginRegister(function activate(api) {
       hint.style.marginTop = "8px";
       hint.textContent =
         "偏移：SetSpeed 的 floor 相加（正数往后挪格）；修复#1：暂停 (1,2)→2、(2,3)→2；" +
-        "修复#2：暂停拍数 > 2 时再减 1 拍；" +
+        "修复#2：修复#1 后仍 > 2 拍时再减 1 拍；" +
+        "自动 Twirl：开启后按最终 angleData 生成，并忽略手动 Twirl 轨道；" +
+        "快速跑动：8 分三角、6 分三角、16/32 分之字、12/24 分同号；" +
         "装饰泳道：按轨道颜色生成菱形 + 行星，另含小节线与红色播放头（1 拍 = 1 格）；" +
         "泳道间距越小越紧凑（默认 0.5 格）。" +
-        "近整拍吸附：拍差距整数 ≤ 0.05 且不在网格上时按整拍计算，消除几度的弯曲。" +
+        "近整拍吸附：拍差距整数 ≤ 0.05 时按整拍计算，消除几度的弯曲。" +
         "发卡弯同号 / 闭环朝上：把发卡弯统一同号并镜像朝下的闭环段（会改变形态）。";
       wrap.appendChild(hint);
 
