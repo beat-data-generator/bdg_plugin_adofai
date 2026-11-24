@@ -1,14 +1,14 @@
 {
   "id": "dev.bdg.adofai-export",
-  "version": "0.4.0",
+  "version": "0.4.1",
   "apiVersion": 2,
   "name": {
     "zh": "ADOFAI 导出",
     "en": "ADOFAI Export"
   },
   "description": {
-    "zh": "把踩点工程导出为 A Dance of Fire and Ice (.adofai) 关卡：双押/多押、快速跑动、发卡处理、Pause 补偿、近整拍吸附，支持旧版(0.2)/新版(0.3)两种核心模型，并可生成装饰泳道与多轨预览。",
-    "en": "Export the project as a Dance of Fire and Ice (.adofai) level with double/multi press, rapid runs, hairpins, pause compensation and beat snapping. Dual core models (legacy 0.2 / modern 0.3), decoration lanes and multi-track preview."
+    "zh": "把踩点工程导出为 A Dance of Fire and Ice (.adofai) 关卡：双押/多押、快速跑动、发卡处理、Pause 补偿、近整拍吸附，支持旧版(0.2)/新版(0.3.5)两种核心模型，新版含 2.5° 低速封顶、音频复制，并可生成装饰泳道与多轨预览。",
+    "en": "Export the project as a Dance of Fire and Ice (.adofai) level with double/multi press, rapid runs, hairpins, pause compensation and beat snapping. Dual core models (legacy 0.2 / modern 0.3.5 with low-speed 2.5° cap and audio copy), decoration lanes and multi-track preview."
   },
   "main": "main.js",
   "renderer": "renderer.js"

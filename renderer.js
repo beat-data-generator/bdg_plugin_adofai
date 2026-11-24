@@ -104,13 +104,41 @@ window.__bdgPluginRegister(function activate(api) {
     return r;
   }
 
+  // 绝对拍位吸附（新版模型 / snapNearInt 开启时）：拍位置靠近整数、且不在工程
+  // 网格上时直接吸到整数拍。只吸「拍差」不够——像 640.9668 这种离 641 只差
+  // 0.03 拍的杂点，自身拍差会被吸成 1，但下一个拍差变成 0.03，生成接近回头的
+  // 174° 小弯。先把拍位置本身吸到 641，两个拍会自然合并。
+  function snapBeatPos(v, tolerance, gridDiv) {
+    var r = Math.round(v);
+    var d = Math.abs(v - r);
+    if (d > tolerance || d < 1e-9) return v;
+    if (gridDiv > 0) {
+      var k = v * gridDiv;
+      if (Math.abs(k - Math.round(k)) < 1e-6) return v; // 合法网格位置
+    }
+    return r;
+  }
+
+  // 读取各类轨道点时统一走的 beat 归一：先 1e-6 去重，新版模型再按 opts 做绝对拍位吸附。
+  function readBeat(s, v, opts) {
+    var b = snapBeat(v);
+    if (opts && opts.snapNearInt) {
+      b = snapBeatPos(b, opts.snapTolerance, Number(s.gridDiv) || 0);
+    }
+    return b;
+  }
+
   // 逐拍差只算一次：角度、Pause、夹角检查共用同一份吸附结果，日志也只记一次。
   // trackCfg 是“当前核心模型实际生效”的配置：旧版模型会强制关闭吸附等轨道启发式。
-  function buildDiffTable(beats, trackCfg) {
+  // timeOfBeat 非空时（新版模型）：逐拍差改用工程 tempo map 的真实时间差，
+  //   换算成「基础拍」——这样音频变速时导出的砖不会按等拍网格累积漂移。
+  function buildDiffTable(beats, trackCfg, timeOfBeat) {
     var out = new Array(beats.length);
     out[0] = 0;
     for (var j = 1; j < beats.length; j++) {
-      var raw = beats[j] - beats[j - 1];
+      var raw = timeOfBeat
+        ? timeOfBeat(beats[j]) - timeOfBeat(beats[j - 1])
+        : beats[j] - beats[j - 1];
       var snapped = trackCfg.snapNearInt
         ? snapDiff(raw, trackCfg.snapTolerance)
         : raw;
@@ -234,13 +262,13 @@ window.__bdgPluginRegister(function activate(api) {
   }
 
   // 只统计音砖轨道（排除 BPM 与多押事件轨道）：多押点只声明该位置怎么多押，不产生音砖。
-  function scanBeats(s) {
+  function scanBeats(s, opts) {
     var counts = {};
     for (var i = 0; i < s.markers.length; i++) {
       var m = s.markers[i];
       var track = findTrack(s, m.trackId);
       if (isBpmTrack(track) || isMultiTrack(track)) continue;
-      var beat = snapBeat(m.beat);
+      var beat = readBeat(s, m.beat, opts);
       if (beat in counts) counts[beat]++;
       else counts[beat] = 1;
     }
@@ -253,7 +281,7 @@ window.__bdgPluginRegister(function activate(api) {
   }
 
   // 多押轨道点 → { beat: { multiType, maxKeys, angle } }
-  function readMultiPress(s) {
+  function readMultiPress(s, opts) {
     var plan = {};
     for (var i = 0; i < s.markers.length; i++) {
       var m = s.markers[i];
@@ -264,19 +292,19 @@ window.__bdgPluginRegister(function activate(api) {
       var maxKeys = Number(attrs.maxKeys != null ? attrs.maxKeys : 3);
       var angle = Number(attrs.angle != null ? attrs.angle : 15);
       if (!(maxKeys >= 2)) maxKeys = 2;
-      plan[snapBeat(m.beat)] = { multiType: multiType, maxKeys: maxKeys, angle: angle };
+      plan[readBeat(s, m.beat, opts)] = { multiType: multiType, maxKeys: maxKeys, angle: angle };
     }
     return plan;
   }
 
-  function readBpmPoints(s) {
+  function readBpmPoints(s, opts) {
     var out = [];
     for (var i = 0; i < s.markers.length; i++) {
       var m = s.markers[i];
       var track = findTrack(s, m.trackId);
       if (isBpmTrack(track) && m.attrs) {
         out.push({
-          beat: snapBeat(m.beat),
+          beat: readBeat(s, m.beat, opts),
           type: m.attrs.speedType,
           value: Number(m.attrs.value),
         });
@@ -288,12 +316,12 @@ window.__bdgPluginRegister(function activate(api) {
     return out;
   }
 
-  function readTwirlSet(s) {
+  function readTwirlSet(s, opts) {
     var set = {};
     for (var i = 0; i < s.markers.length; i++) {
       var m = s.markers[i];
       var track = findTrack(s, m.trackId);
-      if (isTwirlTrack(track)) set[snapBeat(m.beat)] = true;
+      if (isTwirlTrack(track)) set[readBeat(s, m.beat, opts)] = true;
     }
     return set;
   }
@@ -313,6 +341,12 @@ window.__bdgPluginRegister(function activate(api) {
   //   - 多押点会改写当前状态，并从该点起作用于它自己和它后面的所有 beat；
   //   - 后面若再遇到新多押点，则从新点起切换到新状态。
   //   - 初始状态 = 单轨。
+  // 低速多押角度封顶（新版模型）：当前拍 BPM 严格小于基础 BPM 的 1/2 时，
+  // 有效角度 = min(设定角度, 2.5°)。已选更小的角度（如 1°）保持不变。
+  function effectiveMultiAngle(angle, bpmRatio) {
+    return bpmRatio < 0.5 ? Math.min(angle, 2.5) : angle;
+  }
+
   // 核心模型分叉（cfg.coreModel）：
   //   legacy：正常步进用 dir；多押固定 +(180−angle)、carry=+angle×blocks；
   //           旧“双押旋转”在插入块前翻转 dir 并按 floor 补 Twirl。
@@ -322,6 +356,9 @@ window.__bdgPluginRegister(function activate(api) {
     var angleData = [];
     var beatFloor = [];
     var dpTwirlFloors = [];
+    // 与 angleData 逐格对齐的「有效拍差」：收尾自动 Twirl 用它区分 8 分（0.5）
+    // 与附点四分（1.5）——两者都可能算出 ±90°，只有看时间才能决定短弧还是长弧。
+    var floorDiffEff = [];
     var current = 0;
     var carry = 0;
     var dir = 1;
@@ -359,6 +396,18 @@ window.__bdgPluginRegister(function activate(api) {
       // 普通单押 beat 一律不处理（即使当前状态是多押）。
       var pressCount = counts[beats[j]] || 1;
       var isMultiBeat = pressCount >= 2;
+
+      // 新版模型：多押折返/中旋都使用「有效角度」（低速自动封顶）；旧版用原始角度。
+      var multiAngle = legacy
+        ? state.angle
+        : effectiveMultiAngle(state.angle, multAt(beats[j]));
+      if (!legacy && isMultiBeat && state.multiType !== "single" && multiAngle !== state.angle) {
+        panelLog(
+          "  (低速多押角度) beat=" + beats[j] +
+            " ratio=" + multAt(beats[j]) +
+            " angle=" + state.angle + " -> " + multiAngle,
+        );
+      }
 
       var baseSign = legacy ? dir : stepSign;
       var effSign = baseSign;
@@ -429,16 +478,19 @@ window.__bdgPluginRegister(function activate(api) {
         var T = diffEff * 180;
         var presses = Math.min(pressCount, state.maxKeys);
         var pairs = presses - 1;
-        var sumS = (state.angle * pairs * (pairs + 1)) / 2;
+        var sumS = (multiAngle * pairs * (pairs + 1)) / 2;
         if (sumS > 0 && T - sumS >= DP_MIN_TRAVEL) {
           var partial = 0;
           for (var qp = 1; qp <= pairs; qp++) {
-            partial += state.angle * qp;
+            partial += multiAngle * qp;
             var xCurrent = wrap360(current + (T - partial));
             if (qp === 1) beatFloor[j] = angleData.length;
+            floorDiffEff.push(multiAngle / 180); // 折返格：短弧（=多押角度）
             angleData.push(dir * xCurrent);
+            floorDiffEff.push(multiAngle / 180); // 999：0 拍，与下一格同瞬间
             angleData.push(MIDSPIN);
           }
+          floorDiffEff.push((T - sumS) / 180); // 原格：剩余行进角
           angleData.push(dir * current);
           panelLog(
             "  (中旋插入) beat=" + beats[j] +
@@ -449,6 +501,7 @@ window.__bdgPluginRegister(function activate(api) {
         panelLog("  (中旋跳过：T=" + T + " 装不下 Σs=" + sumS + ") beat=" + beats[j]);
       }
 
+      floorDiffEff.push(diffEff);
       angleData.push(dir * current);
       beatFloor[j] = angleData.length - 1;
 
@@ -465,6 +518,7 @@ window.__bdgPluginRegister(function activate(api) {
           if (ldp) dir = -dir;
           for (var ql = 0; ql < blocks; ql++) {
             current = wrap360(current + (180 - state.angle));
+            floorDiffEff.push(state.angle / 180);
             angleData.push(dir * current);
           }
           if (ldp) dpTwirlFloors.push(beatFloor[j] + 1);
@@ -482,23 +536,29 @@ window.__bdgPluginRegister(function activate(api) {
           var curAbs = dir * current;
           var s = resolveMultiTurn(curAbs, cfg.multiTurn);
           for (var qm = 0; qm < blocks; qm++) {
-            current = wrap360(current + dir * s * (180 - state.angle));
+            current = wrap360(current + dir * s * (180 - multiAngle));
+            floorDiffEff.push(multiAngle / 180); // 折返格：短弧（=多押角度）
             angleData.push(dir * current);
           }
-          carry = s * state.angle * blocks;
+          carry = s * multiAngle * blocks;
           stepSign = s;
           panelLog(
             "  (多押-新版) beat=" + beats[j] +
               " 押数=" + pressCount +
               " blocks=" + blocks +
-              " angle=" + state.angle +
+              " angle=" + multiAngle +
               " s=" + s +
               " carry=" + carry,
           );
         }
       }
     }
-    return { angleData: angleData, beatFloor: beatFloor, dpTwirlFloors: dpTwirlFloors };
+    return {
+      angleData: angleData,
+      beatFloor: beatFloor,
+      dpTwirlFloors: dpTwirlFloors,
+      floorDiffEff: floorDiffEff,
+    };
   }
 
   // 发卡弯同号 + 闭环朝上：实验性启发式，开启后整体改写 angleData。
@@ -587,57 +647,147 @@ window.__bdgPluginRegister(function activate(api) {
     return floors;
   }
 
-  // Pause 时长按拍计（引擎把 duration 看作等待拍数）。普通相邻块自占 1 拍，
-  // 故填补有效间距 diffEff 需等待 diffEff − 1 拍。
-  // 修复#2（默认关）：部分回头/大间隔谱面实测会多停 1 拍，开启后 dur > 2 时再减 1。
-  function buildActions(beats, beatFloor, multAt, diffTable) {
+  // 新版自动 Twirl（0.3.5 弧长模型）：按最终 angleData + 每格目标行进角决定短弧/长弧。
+  //   公转方向（CCW/CW）决定同一转角走短弧还是长弧：
+  //     短格（行进 < 1 拍，如 8 分）：让转角与公转方向同号（短弧）；
+  //     长格（行进 > 1 拍，如附点四分 270°）：让两者反号（长弧）。
+  //   当前公转方向不满足目标时，就在该格放 Twirl 并翻转方向，状态连续传递。
+  //   发卡弯（|Δ|≈180°）不参与（Twirl 会让它反而不翻转）。
+  function computeAutoTwirlArc(angleData, floorDiffEff) {
+    var floors = [];
+    var twSign = 1; // 当前公转方向：+1 = 逆时针（+ 转角走短弧）
+    for (var ti = 1; ti < angleData.length; ti++) {
+      if (angleData[ti] === MIDSPIN || angleData[ti - 1] === MIDSPIN) continue;
+      var td = angleData[ti] - angleData[ti - 1];
+      var atd = Math.abs(td);
+      if (atd < 90 - 1e-6 || atd >= 179.5) continue;
+      var de = floorDiffEff[ti] || 0;
+      var ts = td > 0 ? 1 : -1;
+      // 目标公转方向：短格同号、长格反号
+      var want = de > 1 + 1e-9 ? -ts : ts;
+      if (want !== twSign) {
+        floors.push(ti);
+        twSign = want;
+      }
+    }
+    return floors;
+  }
+
+  // Pause 时长按拍计（引擎把 duration 看作等待拍数）。
+  //   legacy（0.2）：普通相邻块自占 1 拍，填补 diffEff 需等待 diffEff − 1；
+  //     倍率用终点 BPM；修复#2（默认关）在 dur > 2 时再减 1。
+  //   modern（0.3.5）：真正的发卡弯（该格最终 |Δ|≈180°）游戏按 2 拍播放，
+  //     自身多占 1 拍，长间隔需再减 1；倍率用起点 beat（SetSpeed 到达后才生效）。
+  function buildActions(beats, beatFloor, multAt, diffTable, angleData, modern) {
     var actions = [];
     for (var j = 0; j < beats.length - 1; j++) {
       var diff = diffTable[j + 1];
-      var mult = multAt(beats[j + 1]);
-      var diffEff = diff * mult;
-      if (diffEff > 2) {
-        var dur = diffEff - 1;
-        // 暂停数值修复#1：(1,2) 向上取整为 2，(2,3) 向下取整为 2。
-        if (config.pauseFix1) {
-          if (dur > 1 && dur < 2) dur = 2;
-          else if (dur > 2 && dur < 3) dur = 2;
+      if (!modern) {
+        var mult0 = multAt(beats[j + 1]);
+        var diffEff0 = diff * mult0;
+        if (diffEff0 > 2) {
+          var dur0 = diffEff0 - 1;
+          if (config.pauseFix1) {
+            if (dur0 > 1 && dur0 < 2) dur0 = 2;
+            else if (dur0 > 2 && dur0 < 3) dur0 = 2;
+          }
+          if (config.pauseFix2 && dur0 > 2) dur0 -= 1;
+          actions.push({
+            floor: beatFloor[j + 1],
+            eventType: "Pause",
+            duration: dur0,
+            countdownTicks: 0,
+            angleCorrectionDir: "Backward",
+          });
         }
-        // 暂停拍数 > 2 时，实测可能多停 1 拍 → 可选减 1 拍（修复#2，默认关）。
-        if (config.pauseFix2 && dur > 2) dur -= 1;
-        actions.push({
-          floor: beatFloor[j + 1],
-          eventType: "Pause",
-          duration: dur,
-          countdownTicks: 0,
-          angleCorrectionDir: "Backward",
-        });
+        continue;
       }
+
+      // 新版：该段行进由「起点 beat」的 BPM 决定（与 buildAngleData 的 multAt 一致）。
+      var mult = multAt(beats[j]);
+      var diffEff = diff * mult;
+      var floor = beatFloor[j + 1];
+      // 180° 发卡格在游戏里占 2 拍（无论 +180 / -180）；直行格占 1 拍。
+      var hairpinBeats = 1;
+      if (floor > 0 && floor < angleData.length) {
+        if (angleData[floor] !== MIDSPIN && angleData[floor - 1] !== MIDSPIN) {
+          if (Math.abs(Math.abs(angleData[floor] - angleData[floor - 1]) - 180) < 0.5) {
+            hairpinBeats = 2;
+          }
+        }
+      }
+      // 需要 Pause 只针对 diffEff > 2 的长间隔：一格最多画 2 拍（180° 发卡 / step=-180），
+      // 超过 2 拍的部分才用 Pause 补。diffEff == 2 时这一格本身就是 2 拍（[0,180] 实测，
+      // 有没有 Twirl 都是 2.0），再挂 Pause 会变成 3 拍 —— 之前 floor 675~692 的一拍
+      // Pause 就是这条误判（0.5 拍 × 4 倍速恰好 = 2）造成的。
+      var needPause = diffEff > 2 + 1e-9;
+      if (!needPause) continue;
+      var dur = diffEff - 1;
+      if (config.pauseFix1) {
+        if (dur > 1 && dur < 2) dur = 2;
+        else if (dur > 2 && dur < 3) dur = 2;
+      }
+      // 发卡格自身占 2 拍，长间隔再减 1；直行格只占 1 拍，不减。
+      if (dur > 2 && hairpinBeats === 2) dur -= 1;
+      actions.push({
+        floor: floor,
+        eventType: "Pause",
+        duration: dur,
+        countdownTicks: 0,
+        angleCorrectionDir: "Backward",
+      });
     }
     return actions;
   }
 
-  function buildSetSpeed(beats, beatFloor, bpmPoints, baseBpm, settings) {
+  // 入参 resolved 由 buildLevel.resolveBpmPoints() 统一解析：每个点已带「累积后的绝对 BPM」
+  // 与「是否绝对点」，确保 SetSpeed 事件和角度换算（bpmAt/multAt）用的是同一组数字，
+  // 绝对 BPM 点不会出现「事件写成 80、几何仍按上一档 214」这种错位。
+  function buildSetSpeed(beats, beatFloor, resolved, baseBpm, settings, modern) {
     var arr = [];
     var idxByBeat = {};
     for (var i = 0; i < beats.length; i++) idxByBeat[beats[i]] = i;
-    var bpm = baseBpm; // 累积当前 BPM，用于把倍频点的 beatsPerMinute 写成累积后的绝对值
-    for (var k = 0; k < bpmPoints.length; k++) {
-      var p = bpmPoints[k];
-      bpm = p.type === "bpm" ? p.value : bpm * p.value;
-      var floor = beatFloor[idxByBeat[p.beat]] + config.speedPlaceOffset;
-      // floor ≤ 0 上的 SetSpeed 会被引擎忽略：改为写进 settings 的初始 BPM。
+    // 两种模型都是「相对上一个点的 BPM」累积（与游戏编辑器一致）：
+    //   倍频点：target = 当前 BPM × value；绝对 BPM 点：target = value。
+    //   第一个点相对于初始 BPM（baseBpm / 首拍 BPM）。
+    //   modern 额外把「首拍 BPM」写进 settings.bpm，因此第一个点写相邻比值（通常为 1）。
+    var prevBpm = modern ? (settings.bpm || baseBpm) : baseBpm;
+    for (var k = 0; k < resolved.length; k++) {
+      var r = resolved[k];
+      var target = r.bpm;
+      var floor = beatFloor[idxByBeat[r.beat]] + config.speedPlaceOffset;
+      if (modern) {
+        if (floor <= 0) {
+          settings.bpm = target;
+          prevBpm = target;
+          panelLog("  (初始BPM) beat=" + r.beat + " -> settings.bpm=" + target);
+          continue;
+        }
+        arr.push({
+          floor: floor,
+          eventType: "SetSpeed",
+          speedType: r.abs ? "Bpm" : "Multiplier",
+          beatsPerMinute: target,
+          // 游戏里 Multiplier 乘在【当前 BPM】上；这里写「目标 / 上一事件后的 BPM」，
+          // 首拍点因已被 settings.bpm 吸收，比值会是 1。
+          bpmMultiplier: r.abs ? 1 : target / prevBpm,
+          angleOffset: 0,
+        });
+        prevBpm = target;
+        continue;
+      }
+      // legacy（0.2）
       if (floor <= 0) {
-        settings.bpm = bpm;
-        panelLog("  (初始BPM) beat=" + p.beat + " -> settings.bpm=" + bpm);
+        settings.bpm = target;
+        panelLog("  (初始BPM) beat=" + r.beat + " -> settings.bpm=" + target);
         continue;
       }
       arr.push({
         floor: floor,
         eventType: "SetSpeed",
-        speedType: p.type === "bpm" ? "Bpm" : "Multiplier",
-        beatsPerMinute: bpm,
-        bpmMultiplier: p.type === "bpm" ? 1 : p.value,
+        speedType: r.abs ? "Bpm" : "Multiplier",
+        beatsPerMinute: target,
+        bpmMultiplier: r.abs ? 1 : r.value,
         angleOffset: 0,
       });
     }
@@ -666,6 +816,7 @@ window.__bdgPluginRegister(function activate(api) {
     var bpm = baseBpm;
     for (var i = 0; i < bpmPoints.length; i++) {
       var p = bpmPoints[i];
+      // 与 bpmAt 一致：倍频乘在当前 BPM 上累积。
       bpm = p.type === "bpm" ? p.value : bpm * p.value;
       var ratio = bpm / baseBpm;
       if (ratio > 8 && ratio < 16) {
@@ -683,7 +834,7 @@ window.__bdgPluginRegister(function activate(api) {
   // 导出检查（仅提醒，不阻拦）②：真·多押 beat 上的有效 travel 小于该点多押角度。
   //   travel = diffEff × 180（有效拍数 × 180°，直线 1 拍 = 180°；
   //   不能用 |180 − step|：diffEff 为偶数整拍时 step 会 wrap，得出假的 travel=0）。
-  function checkSmallAngles(beats, counts, beatFloor, multiPlan, multAt, diffTable) {
+  function checkSmallAngles(beats, counts, beatFloor, multiPlan, multAt, diffTable, modern) {
     var out = [];
     var state = { multiType: "single", maxKeys: 3, angle: 15 };
     var lastWarnBeat = null;
@@ -696,11 +847,14 @@ window.__bdgPluginRegister(function activate(api) {
       var diffEff = diff * mult;
       var travel = diffEff * 180;
       var isMultiBeat = (counts[beats[j]] || 1) >= 2;
-      if (state.multiType !== "single" && isMultiBeat && travel < state.angle - 1e-9) {
+      var multiAngle = modern
+        ? effectiveMultiAngle(state.angle, multAt(beats[j]))
+        : state.angle;
+      if (state.multiType !== "single" && isMultiBeat && travel < multiAngle - 1e-9) {
         if (lastWarnBeat === null || beats[j] - lastWarnBeat > 1) {
           out.push(
             "夹角 beat " + beats[j] + "（floor " + beatFloor[j] + "）：travel " +
-              round2(travel) + "° < 多押角度 " + state.angle + "°，请检查。",
+              round2(travel) + "° < 多押角度 " + multiAngle + "°，请检查。",
           );
           lastWarnBeat = beats[j];
         }
@@ -753,7 +907,7 @@ window.__bdgPluginRegister(function activate(api) {
     };
   }
 
-  function buildDecorations(s, beatFloor, beats, angleData, bpb) {
+  function buildDecorations(s, beatFloor, beats, angleData, bpb, opts) {
     var decos = [];
     var acts = [];
     if (!config.fakeLanes) return { decorations: decos, actions: acts };
@@ -793,7 +947,7 @@ window.__bdgPluginRegister(function activate(api) {
       for (var mi = 0; mi < s.markers.length; mi++) {
         var m = s.markers[mi];
         if (m.trackId !== lane.id) continue;
-        var lx = xOfBeat(snapBeat(m.beat));
+        var lx = xOfBeat(readBeat(s, m.beat, opts));
         decos.push(makeDeco(baseFloor, "bdg_lane_dot.png", lx, laneY, 22, color));
         if (!firstDone) {
           firstDone = true;
@@ -995,30 +1149,71 @@ window.__bdgPluginRegister(function activate(api) {
     var baseBpm = s.baseBpm;
     var settings = {};
     for (var k in DEFAULT_SETTINGS) settings[k] = DEFAULT_SETTINGS[k];
-    settings.songFilename = s.audioName || "";
+
+    var modernCore = config.coreModel === "modern";
+    var legacyCore = !modernCore;
+    // 新版模型对齐 v19 示例：关卡版本 / 缩放 / 默认背景；旧版保持 0.2 默认不变。
+    if (modernCore) {
+      settings.version = 19;
+      settings.zoom = 200;
+      settings.showDefaultBGTile = false;
+      settings.defaultBGShapeType = "Disabled";
+    }
+    // 关卡音乐只填文件名（不带路径）：新版会在导出时把音频复制到关卡同目录。
+    // 旧版保持 0.2 行为（直接用 audioName），保证逐字节一致。
+    if (modernCore) {
+      var audioAbs = api.system.audioPath ? api.system.audioPath() : null;
+      var audioSrc = audioAbs || s.audioName || "";
+      settings.songFilename = audioSrc ? String(audioSrc).split(/[\\/]/).pop() : "";
+    } else {
+      settings.songFilename = s.audioName || "";
+    }
     settings.bpm = baseBpm;
     settings.offset = Math.round(s.offsetMs);
 
-    var scan = scanBeats(s);
+    // 旧版模型的“轨道生成”必须与 0.2 完全一致：吸附/快速跑动/发卡后处理
+    // 都属于新版轨道启发式，即使配置里残留开启，也不参与旧版导出。
+    var trackCfg = {
+      coreModel: config.coreModel,
+      legacyDoubleTwirl: config.legacyDoubleTwirl,
+      multiTurn: config.multiTurn,
+      rapidRuns: legacyCore ? false : config.rapidRuns,
+      snapNearInt: legacyCore ? false : config.snapNearInt,
+      snapTolerance: config.snapTolerance,
+      normalizeAngles: legacyCore ? false : config.normalizeAngles,
+    };
+
+    var scan = scanBeats(s, trackCfg);
     var beats = scan.beats;
     var counts = scan.counts;
     var beatSet = {};
     for (var i = 0; i < beats.length; i++) beatSet[beats[i]] = true;
 
-    var bpmPoints = readBpmPoints(s);
+    var bpmPoints = readBpmPoints(s, trackCfg);
     for (var v = 0; v < bpmPoints.length; v++) {
       if (!(bpmPoints[v].beat in beatSet)) {
         return { error: "BPM 点 beat " + bpmPoints[v].beat + " 未落在 marker 上，拒绝导出。" };
       }
     }
 
-    // 累积计算当前 BPM：从 baseBpm 起，依次套用每个点——
-    //   「BPM值」= 绝对重置；「倍频」= 乘在当前 BPM 上（连续两个 2 倍频 => ×4）。
-    function bpmAt(beat) {
+    // 统一解析 BPM 点：从 baseBpm 起依次套用——
+    //   「BPM值」= 绝对重置；「倍频」= 乘在当前 BPM 上（与游戏编辑器一致；
+    //   连续两个 2 倍频 => ×4）。resolvedBpm 是唯一来源：角度换算与 SetSpeed 共用，
+    //   绝对 BPM 点绝不会只改事件、不改几何。
+    var resolvedBpm = [];
+    (function () {
       var bpm = baseBpm;
       for (var q = 0; q < bpmPoints.length; q++) {
         var p = bpmPoints[q];
-        if (p.beat <= beat) bpm = p.type === "bpm" ? p.value : bpm * p.value;
+        var isAbs = p.type === "bpm";
+        bpm = isAbs ? p.value : bpm * p.value;
+        resolvedBpm.push({ beat: p.beat, bpm: bpm, abs: isAbs, value: p.value });
+      }
+    })();
+    function bpmAt(beat) {
+      var bpm = baseBpm;
+      for (var q = 0; q < resolvedBpm.length; q++) {
+        if (resolvedBpm[q].beat <= beat) bpm = resolvedBpm[q].bpm;
         else break;
       }
       return bpm;
@@ -1027,15 +1222,17 @@ window.__bdgPluginRegister(function activate(api) {
     function multAt(beat) {
       return bpmAt(beat) / baseBpm;
     }
+    // 新版：开头（第一块砖）的 BPM 写入 settings.bpm，beat 0 的倍频点直接生效。
+    if (modernCore) settings.bpm = bpmAt(beats.length ? beats[0] : 0);
 
-    var twirlSet = readTwirlSet(s);
+    var twirlSet = readTwirlSet(s, trackCfg);
     for (var b in twirlSet) {
       if (!(b in beatSet)) {
         return { error: "旋转点 beat " + b + " 未落在 marker 上，拒绝导出。" };
       }
     }
 
-    var multiPlan = readMultiPress(s);
+    var multiPlan = readMultiPress(s, trackCfg);
     for (var bb in multiPlan) {
       if (!(bb in beatSet)) {
         return { error: "多押点 beat " + bb + " 未落在 marker 上，拒绝导出。" };
@@ -1044,7 +1241,9 @@ window.__bdgPluginRegister(function activate(api) {
 
     var _bpmLog = baseBpm;
     for (var pp = 0; pp < bpmPoints.length; pp++) {
-      _bpmLog = bpmPoints[pp].type === "bpm" ? bpmPoints[pp].value : _bpmLog * bpmPoints[pp].value;
+      _bpmLog = bpmPoints[pp].type === "bpm"
+        ? bpmPoints[pp].value
+        : _bpmLog * bpmPoints[pp].value;
       panelLog(
         "  BPM点 beat=" + bpmPoints[pp].beat +
           " type=" + bpmPoints[pp].type +
@@ -1063,20 +1262,17 @@ window.__bdgPluginRegister(function activate(api) {
       );
     }
 
-    // 旧版模型的“轨道生成”必须与 0.2 完全一致：吸附/快速跑动/发卡后处理
-    // 都属于新版轨道启发式，即使配置里残留开启，也不参与旧版导出。
-    var legacyCore = config.coreModel === "legacy";
-    var trackCfg = {
-      coreModel: config.coreModel,
-      legacyDoubleTwirl: config.legacyDoubleTwirl,
-      multiTurn: config.multiTurn,
-      rapidRuns: legacyCore ? false : config.rapidRuns,
-      snapNearInt: legacyCore ? false : config.snapNearInt,
-      snapTolerance: config.snapTolerance,
-      normalizeAngles: legacyCore ? false : config.normalizeAngles,
-    };
-
-    var diffTable = buildDiffTable(beats, trackCfg);
+    // 新版：用工程 tempo map（api.project.timeOfBeat）把相邻拍的真实时间差折回
+    // 「基础拍」，角度 / Pause / 夹角检查都跟着音频走；不再假设等拍网格。
+    // 旧版模型保持逐字节一致，仍用原始拍差。
+    var beatMs = 60000 / baseBpm;
+    var hasTempo =
+      modernCore && baseBpm > 0 &&
+      api.project && typeof api.project.timeOfBeat === "function";
+    var timeBeats = hasTempo
+      ? function (b) { return api.project.timeOfBeat(b) / beatMs; }
+      : null;
+    var diffTable = buildDiffTable(beats, trackCfg, timeBeats);
     // 自动 Twirl 与手动 Twirl 互斥：自动规则基于最终 angleData 计算，
     // 若同时计入手动 Twirl 会重复翻转，因此自动模式忽略手动 Twirl 轨道。
     var autoTwirl = config.twirlMode === "auto";
@@ -1091,15 +1287,19 @@ window.__bdgPluginRegister(function activate(api) {
     );
     if (trackCfg.normalizeAngles) normalizeAngles(built.angleData);
     if (autoTwirl) {
-      built.autoTwirlFloors = computeAutoTwirl(
-        built.angleData,
-        config.autoTwirlThreshold,
-        config.hairpinExclude,
-      );
+      built.autoTwirlFloors = modernCore
+        ? computeAutoTwirlArc(built.angleData, built.floorDiffEff)
+        : computeAutoTwirl(
+            built.angleData,
+            config.autoTwirlThreshold,
+            config.hairpinExclude,
+          );
     }
 
-    var actions = buildActions(beats, built.beatFloor, multAt, diffTable);
-    actions = actions.concat(buildSetSpeed(beats, built.beatFloor, bpmPoints, baseBpm, settings));
+    var actions = buildActions(beats, built.beatFloor, multAt, diffTable, built.angleData, modernCore);
+    actions = actions.concat(
+      buildSetSpeed(beats, built.beatFloor, resolvedBpm, baseBpm, settings, modernCore),
+    );
     if (autoTwirl) {
       for (var at = 0; at < built.autoTwirlFloors.length; at++) {
         actions.push({ floor: built.autoTwirlFloors[at], eventType: "Twirl" });
@@ -1115,7 +1315,14 @@ window.__bdgPluginRegister(function activate(api) {
       }
     }
     // 装饰泳道（含小节线 / 播放头动作）；小节拍数由 barBeats 控制
-    var decoPack = buildDecorations(s, built.beatFloor, beats, built.angleData, config.barBeats);
+    var decoPack = buildDecorations(
+      s,
+      built.beatFloor,
+      beats,
+      built.angleData,
+      config.barBeats,
+      trackCfg,
+    );
     actions = actions.concat(decoPack.actions);
     actions.sort(function (a, b) {
       if (a.floor !== b.floor) return a.floor - b.floor;
@@ -1140,9 +1347,11 @@ window.__bdgPluginRegister(function activate(api) {
       warnings.push("自动 Twirl 已开启：手动 Twirl 轨道被忽略");
     }
     if (config.showChecks) {
-      warnings = warnings.concat(checkBpmRange(baseBpm, bpmPoints, built.beatFloor, idxByBeat));
       warnings = warnings.concat(
-        checkSmallAngles(beats, counts, built.beatFloor, multiPlan, multAt, diffTable),
+        checkBpmRange(baseBpm, bpmPoints, built.beatFloor, idxByBeat),
+      );
+      warnings = warnings.concat(
+        checkSmallAngles(beats, counts, built.beatFloor, multiPlan, multAt, diffTable, modernCore),
       );
     }
 
@@ -1213,25 +1422,54 @@ window.__bdgPluginRegister(function activate(api) {
           type: "success",
           durationMs: 4000,
         });
-        // 装饰素材写到关卡同目录（decorationImage 按关卡目录解析）
+        // 装饰素材 + 音乐都写到关卡同目录（decorationImage / songFilename 按关卡目录解析）
         var dir = String(savedPath).replace(/[\\/][^\\/]*$/, "");
-        if (!config.fakeLanes) return;
-        return Promise.all([
-          api.system.writeBytes(dir + "/bdg_lane_dot.png", diamondPng(64)),
-          api.system.writeBytes(dir + "/bdg_lane_planet.png", planetPng(64)),
-          api.system.writeBytes(dir + "/bdg_lane_line.png", linePng(64)),
-        ]).then(function (results) {
-          if (results.some(function (r) { return !r; })) {
-            api.log("adofai export: lane png write returned false");
-            api.ui.notify({
-              message: "装饰素材写入失败，关卡中的图片可能缺失。",
-              type: "warning",
-              durationMs: 8000,
-            });
-            return;
-          }
-          api.log("adofai export: lane png written");
-        });
+        var jobs = [];
+        if (config.fakeLanes) {
+          jobs.push(
+            Promise.all([
+              api.system.writeBytes(dir + "/bdg_lane_dot.png", diamondPng(64)),
+              api.system.writeBytes(dir + "/bdg_lane_planet.png", planetPng(64)),
+              api.system.writeBytes(dir + "/bdg_lane_line.png", linePng(64)),
+            ]).then(function (results) {
+              if (results.some(function (r) { return !r; })) {
+                api.log("adofai export: lane png write returned false");
+                api.ui.notify({
+                  message: "装饰素材写入失败，关卡中的图片可能缺失。",
+                  type: "warning",
+                  durationMs: 8000,
+                });
+                return;
+              }
+              api.log("adofai export: lane png written");
+            }),
+          );
+        }
+        // 复制关卡音乐（仅新版，与 songFilename 取音频路径保持一致）；
+        // 目标已存在则跳过，不做无谓覆盖。
+        var audioAbs = null;
+        if (config.coreModel === "modern" && api.system.audioPath) {
+          audioAbs = api.system.audioPath();
+        }
+        if (audioAbs) {
+          var audioName = String(audioAbs).split(/[\\/]/).pop();
+          var audioDest = dir + "/" + audioName;
+          jobs.push(
+            api.system.readBytes(audioDest).then(function (existing) {
+              if (existing) {
+                api.log("adofai export: audio exists, skip");
+                return;
+              }
+              return api.system.readBytes(audioAbs).then(function (bytes) {
+                if (!bytes) return;
+                return api.system.writeBytes(audioDest, bytes).then(function () {
+                  api.log("adofai export: audio copied");
+                });
+              });
+            }),
+          );
+        }
+        return Promise.all(jobs);
       })
       .catch(function (err) {
         var msg2 = err && err.message ? err.message : String(err);
@@ -1300,6 +1538,7 @@ window.__bdgPluginRegister(function activate(api) {
         default: 15,
         options: [
           { value: 1, label: "1°" },
+          { value: 2.5, label: "2.5°（低速多押建议）" },
           { value: 5, label: "5°" },
           { value: 15, label: "15°" },
           { value: 22.5, label: "22.5°" },

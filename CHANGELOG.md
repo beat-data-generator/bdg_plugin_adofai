@@ -1,5 +1,29 @@
 # Changelog
 
+## 未发布
+
+### 新版（modern）
+- **变速对齐**：逐拍差改走工程 tempo map（`api.project.timeOfBeat`），角度 / Pause / 夹角检查都用真实时间差换算的「基础拍」；复杂变速段落不再按等拍网格累积漂移。onset 检测确认音频严格跟随该 tempo map。
+- **Pause 修正**：`diffEff == 2` 时该格本身就是 2 拍（`[0,180]` 实测，Twirl 与否均为 2.0），不再额外补 `Pause 1`；修复 floor 675–692 等处每格多出一拍暂停。Pause 只用于 `diffEff > 2` 的长间隔。
+- **BPM 轨道**：倍频改为相对**上一个 BPM 点**累积（游戏编辑器口径）：`target = 当前 BPM × value`，无前置点则基于 `baseBpm`；`bpmMultiplier` 写 `target / 上一事件后的 BPM`。与 legacy 的累积语义统一，两模型差别仅在 `settings.bpm` / 事件写法。
+
+## 0.4.1
+
+将 0.3.1–0.3.5 的修复与功能同步进本项目。**全部只在新版（modern）生效，legacy 导出仍与 0.2 逐字节一致。**
+
+### 新版（modern）
+- 倍频改为相对**基础 BPM**（`baseBpm × value`），`bpmMultiplier` 写相邻目标比值，`settings.bpm` 取首拍 BPM；不再累积衰减（0.3.1）。
+- 新增**绝对拍位吸附** `snapBeatPos`：`snapNearInt` 开启时，踩点/多押/BPM/旋转/装饰都把近整数拍位置吸到整数，治 `640.9668` 这类杂点产生的 174° 假回头（0.3.2）。
+- **Pause** 改用起点 beat 的 BPM，并按最终 `angleData` 判断发卡格：发卡占 2 拍、`diffEff=2` 被 carry 拉直时补 `Pause 1`、长发卡再减 1（0.3.3）。
+- 自动 Twirl 改为**弧长模型**：按每格 `floorDiffEff` 目标行进区分短弧/长弧（8 分短弧、附点四分 270° 长弧）（0.3.4/0.3.5）。
+- 新增 **`2.5°`** 多押角度选项；当前拍 BPM 严格小于基础 BPM 的 1/2 时，有效角度自动封顶 `min(设定角度, 2.5°)`，离开低速段恢复（0.3.5）。
+- 关卡音乐：`songFilename` 取音频文件名；导出时把音频复制到关卡同目录（已存在则跳过）（0.3.4）。
+- 默认 settings 对齐 v19 示例：`version 19` / `zoom 200` / 默认背景关（0.3.4）。
+
+### 兼容
+- `legacy` 分支行为不变：累积倍频、终点 BPM Pause、旧自动 Twirl、`audioName` 直接写入、0.2 默认 settings、不复制音频。
+- 逐拍差仍统一走 `buildDiffTable`；`floorDiffEff` 只服务新版自动 Twirl。
+
 ## 0.4.0
 
 双核心模型：保留旧版行为，同时补齐新版（0.3.0）全部功能。
